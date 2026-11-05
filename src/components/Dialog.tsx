@@ -1,4 +1,5 @@
 import { useEffect, useRef, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import { X } from "lucide-react";
 
 /**
@@ -67,8 +68,8 @@ export default function Dialog({
   }, [open]);
 
   if (!open) return null;
-  return (
-    <div className="motion-backdrop fixed inset-0 z-30 flex items-center justify-center bg-black/40 p-6" onMouseDown={onClose}>
+  return createPortal(
+    <div className="motion-backdrop fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-6" onMouseDown={onClose}>
       <div
         ref={panel}
         role="dialog"
@@ -91,7 +92,8 @@ export default function Dialog({
         <div className="min-h-0 overflow-y-auto px-6 py-5">{children}</div>
         {footer && <div className="flex justify-end gap-2 border-t border-line px-6 py-4">{footer}</div>}
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
 

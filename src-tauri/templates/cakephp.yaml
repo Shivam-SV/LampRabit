@@ -7,13 +7,22 @@ color: rose
 duration: Composer · about a minute
 requires:
   php: "8.1"
-  extensions: [intl, mbstring, pdo_mysql, simplexml]
+  extensions: [intl, mbstring, simplexml]
 database: optional
+engines: [mariadb, mysql, postgres]
 steps:
   - create_database: {}
   - name: Creating the project with Composer (cakephp/app)
     cwd: www
     composer: [create-project, cakephp/app, "{{project}}", --prefer-dist, --no-interaction, --no-progress]
+  # app.php names the MySQL driver for every connection; app_local.php overrides it.
+  # Before the step below, which changes the host this looks for.
+  - name: Connecting the database
+    if: db.pdo == pgsql
+    replace:
+      file: config/app_local.php
+      values:
+        "'host' => 'localhost',": "'driver' => \\Cake\\Database\\Driver\\Postgres::class,\n            'host' => 'localhost',"
   - name: Connecting the database
     if: database
     replace:

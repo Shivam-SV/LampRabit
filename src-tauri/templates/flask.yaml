@@ -1,0 +1,48 @@
+schema: 1
+id: flask
+name: Flask
+description: A small Flask app in app.py, in its own virtual environment, reloaded when you save.
+icon: terminal
+color: zinc
+duration: pip · seconds
+requires:
+  python: "3.10"
+steps:
+  - name: Creating a virtual environment (.venv)
+    run: python -m venv .venv
+  - name: Installing Flask
+    run: "{{venv.python}} -m pip install --disable-pip-version-check flask"
+  - name: Creating app.py
+    write:
+      path: app.py
+      content: |
+        from flask import Flask, jsonify
+
+        app = Flask(__name__)
+
+
+        @app.get("/")
+        def index():
+            return jsonify(message="Hello from {{project}}")
+  - name: Writing requirements.txt
+    write:
+      path: requirements.txt
+      content: |
+        flask
+  - name: Ignoring the virtual environment in Git
+    write:
+      path: .gitignore
+      content: |
+        .venv/
+        __pycache__/
+  - id: git
+    optional: true
+    default: false
+    label: Initialise a Git repository
+    needs: [git]
+    git_init:
+      commit: New Flask project
+serve:
+  mode: dynamic
+  command: "{{venv.python}} -m flask --app app run --debug --host 127.0.0.1 --port {port}"
+done: Start it from the Sites page; it's served at {{url}}.

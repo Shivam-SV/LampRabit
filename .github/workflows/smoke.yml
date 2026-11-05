@@ -1,0 +1,112 @@
+name: Smoke test
+
+# Installs runtimes into a throwaway folder with the real app and puts every service
+# through start → healthy → second start ignored → stop → port free, plus one crash that
+# "Restart after a crash" has to recover from (src-tauri/src/smoke.rs). Runtimes a platform
+# doesn't have (Typesense on Windows, MariaDB on macOS…) are reported as skipped, with why.
+on:
+  pull_request:
+    paths: ["src-tauri/src/**", "src-tauri/Cargo.toml", ".github/workflows/smoke.yml"]
+  schedule:
+    # Tuesdays, after Monday's runtime builds: catches upstream download changes too.
+    - cron: "0 6 * * 2"
+  workflow_dispatch:
+    inputs:
+      full:
+        description: "Also the heavy services (Elasticsearch, OpenSearch, Neo4j, RabbitMQ, pgAdmin, Go, Rust)"
+        type: boolean
+        default: false
+      runtimes:
+        description: "Only these runtime ids, space-separated (instead of the lists below)"
+        type: string
+        default: ""
+
+concurrency:
+  group: smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Every service LampRabit runs, plus the tools and languages they need.
+  RUNTIMES: >-
+    apache nginx caddy frankenphp php composer mariadb mysql postgres mongodb mongosh
+    redis memcached mailpit sqlite meilisearch typesense rustfs minio clickhouse
+    java tomcat maven gradle adminer phpmyadmin phppgadmin
+  # Large downloads and slow starts: weekly, or when asked for.
+  HEAVY: elasticsearch opensearch neo4j erlang rabbitmq python pgadmin go rust
+
+jobs:
+  smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-24.04, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+      - name: Linux system libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          # Tauri's, a display for WebKitGTK (no window opens), and MySQL's libaio.
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libdbus-1-dev pkg-config xvfb libaio1t64
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      # Tauri's build script embeds the frontend, so it has to exist.
+      - run: npm ci && npm run build
+      # A debug build: on Windows it keeps a console, so the test's output reaches the log.
+      - name: Build
+        working-directory: src-tauri
+        run: cargo build
+      - name: Smoke test
+        shell: bash
+        env:
+          # Most catalogs use GitHub's API; anonymous requests run out quickly.
+          GITHUB_TOKEN: ${{ github.token }}
+          ONLY: ${{ inputs.runtimes || '' }}
+          FULL: ${{ inputs.full || github.event_name == 'schedule' }}
+        run: |
+          list="$ONLY"
+          if [ -z "$list" ]; then
+            list="$RUNTIMES"
+            [ "$FULL" = "true" ] && list="$list $HEAVY"
+          fi
+          root="$RUNNER_TEMP/lamprabit-smoke"
+          bin="src-tauri/target/debug/lamprabit"
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            GDK_BACKEND=x11 xvfb-run -a "$bin" --smoke-test "$root" $list
+          else
+            "$bin" --smoke-test "$root" $list
+          fi
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          python3 - "$RUNNER_TEMP/lamprabit-smoke/smoke-report.json" >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          import json, sys
+          try:
+              steps = json.load(open(sys.argv[1]))
+          except OSError:
+              print("No report: the smoke test didn't get far enough to write one.")
+              sys.exit()
+          icon = {"ok": "✅", "skipped": "⏭️", "failed": "❌"}
+          print(f"### Smoke test on {__import__('os').environ['RUNNER_OS']}\n\n| | Step | Detail | Seconds |\n|---|---|---|---|")
+          for s in steps:
+              detail = s["detail"].split("\n")[0].replace("|", "\\|")
+              print(f"| {icon[s['result']]} | {s['name']} | {detail} | {s['seconds']:.0f} |")
+          EOF
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: smoke-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/lamprabit-smoke/smoke-report.json
+            ${{ runner.temp }}/lamprabit-smoke/logs/
+            ${{ runner.temp }}/lamprabit-smoke/etc/
+          if-no-files-found: ignore

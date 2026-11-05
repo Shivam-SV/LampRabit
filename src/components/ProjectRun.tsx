@@ -1,11 +1,11 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ChevronRight, Package, Play, Plus, RefreshCw, RotateCcw, ScrollText, Search, Square, Terminal, Trash2, X } from "lucide-react";
+import { ChevronRight, Infinity as Forever, Play, Plus, RefreshCw, RotateCcw, ScrollText, Search, Square, Trash2, X } from "lucide-react";
 import clsx from "clsx";
 import { api, type AppInfo, type AppOutput, type AppStatus, type NodeApp, type PackageManager, type ProjectCommand, type Site } from "../lib/api";
 import { useAppStore } from "../lib/store";
-import { Button, Segmented, Switch, inputClass } from "./ui";
+import { Button, Segmented, inputClass } from "./ui";
 
 /** How each package manager runs a script, and passes it extra arguments. */
 const runPrefix: Record<PackageManager, { run: string; args: string }> = {
@@ -150,7 +150,15 @@ export function ServeSettings({ site, info, status }: { site: Site; info: AppInf
             {customising ? null : (
               <span className="flex min-w-0 items-center gap-2">
                 <code className="truncate rounded-md bg-surface-2 px-2 py-1 font-mono text-xs">{appCommand(draft) || "none"}</code>
-                <Button size="sm" variant="ghost" onClick={() => setCustomising(true)}>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => {
+                    // An old "node file" setup becomes the command it ran, e.g. node --watch server.js.
+                    if (draft.mode === "file") set({ mode: "command", command: appCommand(draft) });
+                    setCustomising(true);
+                  }}
+                >
                   Change
                 </Button>
               </span>
@@ -158,48 +166,28 @@ export function ServeSettings({ site, info, status }: { site: Site; info: AppInf
           </Row>
           {customising && (
             <div className="space-y-3 rounded-xl border border-line p-3">
-              <Segmented
-                value={draft.mode}
-                onChange={(mode) => set({ mode })}
-                options={[
-                  { value: "command", label: "Command", icon: <Terminal size={14} /> },
-                  { value: "file", label: "Node file", icon: <Package size={14} /> },
-                ]}
-                className="w-60"
-              />
-              {draft.mode === "command" ? (
-                <>
-                  <input className={clsx(inputClass, "font-mono")} value={draft.command} onChange={(e) => set({ command: e.target.value })} placeholder="npm run dev" aria-label="Start command" data-autofocus />
-                  <p className="text-xs text-muted">
-                    <code className="font-mono">{"{port}"}</code> becomes the port LampRabit picks; $PORT and $HOST are set too.
-                  </p>
-                  {Object.keys(info.scripts).length > 0 && (
-                    <div className="flex flex-wrap items-center gap-1.5">
-                      <span className="text-xs text-muted">Scripts:</span>
-                      {Object.entries(info.scripts).map(([name, script]) => (
-                        <button
-                          key={name}
-                          type="button"
-                          title={script}
-                          onClick={() => {
-                            // Dev servers that ignore $PORT get the port flag (Vite, Astro, Nuxt...).
-                            const flag = node && /\b(vite|astro|nuxt|nuxi)\b/.test(script) ? `${runPrefix[pm].args} --host 127.0.0.1 --port {port}` : "";
-                            set({ command: `${runPrefix[pm].run} ${name}${flag}` });
-                          }}
-                          className="rounded-md border border-line px-2 py-0.5 font-mono text-xs text-muted hover:border-accent/40 hover:text-fg"
-                        >
-                          {name}
-                        </button>
-                      ))}
-                    </div>
-                  )}
-                </>
-              ) : (
-                <div className="flex flex-wrap items-center gap-3">
-                  <input className={clsx(inputClass, "max-w-xs font-mono")} value={draft.file} onChange={(e) => set({ file: e.target.value })} placeholder="server.js" aria-label="File" />
-                  <span className="flex items-center gap-2">
-                    <Switch checked={draft.watch} onChange={(watch) => set({ watch })} label="Restart on changes" /> Restart on changes
-                  </span>
+              <input className={clsx(inputClass, "font-mono")} value={draft.command} onChange={(e) => set({ command: e.target.value })} placeholder="npm run dev" aria-label="Start command" data-autofocus />
+              <p className="text-xs text-muted">
+                <code className="font-mono">{"{port}"}</code> becomes the port LampRabit picks; $PORT and $HOST are set too.
+              </p>
+              {Object.keys(info.scripts).length > 0 && (
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="text-xs text-muted">Scripts:</span>
+                  {Object.entries(info.scripts).map(([name, script]) => (
+                    <button
+                      key={name}
+                      type="button"
+                      title={script}
+                      onClick={() => {
+                        // Dev servers that ignore $PORT get the port flag (Vite, Astro, Nuxt...).
+                        const flag = node && /\b(vite|astro|nuxt|nuxi)\b/.test(script) ? `${runPrefix[pm].args} --host 127.0.0.1 --port {port}` : "";
+                        set({ command: `${runPrefix[pm].run} ${name}${flag}` });
+                      }}
+                      className="rounded-md border border-line px-2 py-0.5 font-mono text-xs text-muted hover:border-accent/40 hover:text-fg"
+                    >
+                      {name}
+                    </button>
+                  ))}
                 </div>
               )}
             </div>
@@ -277,7 +265,7 @@ export function ServeSettings({ site, info, status }: { site: Site; info: AppInf
 export function Row({ title, hint, children }: { title: string; hint?: string; children?: React.ReactNode }) {
   return (
     <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-2">
-      <div className="min-w-0">
+      <div className="min-w-60 flex-1 basis-0">
         <div className="font-medium">{title}</div>
         {hint && <div className="mt-0.5 text-xs text-muted">{hint}</div>}
       </div>
@@ -287,13 +275,25 @@ export function Row({ title, hint, children }: { title: string; hint?: string; c
 }
 
 /** The project's commands: yours, its template's, and what package.json, composer.json and the framework CLIs offer. */
-export function CommandsPanel({ site, status, limit, onMore }: { site: Site; status?: AppStatus; limit?: number; onMore?: () => void }) {
+export function CommandsPanel({
+  site,
+  status,
+  limit,
+  onMore,
+  onKeepRunning,
+}: {
+  site: Site;
+  status?: AppStatus;
+  limit?: number;
+  onMore?: () => void;
+  /** Turns a command into a process that keeps running. */
+  onKeepRunning?: (c: { name: string; command: string }) => void;
+}) {
   const queryClient = useQueryClient();
   const notify = useAppStore((s) => s.notify);
   const onError = (e: unknown) => notify("error", String(e));
   const list = useQuery({ queryKey: ["project-commands", site.name], queryFn: () => api.projectCommands(site.name), staleTime: 5 * 60_000 });
   const [filter, setFilter] = useState("");
-  const [custom, setCustom] = useState("");
   const running = status?.task ?? null;
   const compact = limit != null;
 
@@ -332,56 +332,20 @@ export function CommandsPanel({ site, status, limit, onMore }: { site: Site; sta
       )}
 
       {!compact && (
-        <form
-          className="flex gap-2"
-          onSubmit={(e) => {
-            e.preventDefault();
-            if (custom.trim()) run.mutate({ label: custom.trim(), command: custom.trim() });
-          }}
-        >
+        <div className="flex items-center gap-1.5">
           <label className="flex h-9 min-w-0 flex-1 items-center gap-2 rounded-lg border border-line bg-surface px-3 focus-within:border-accent">
-            <span className="font-mono text-sm text-muted" aria-hidden>
-              $
-            </span>
-            <input
-              value={custom}
-              onChange={(e) => setCustom(e.target.value)}
-              placeholder={site.language === "php" ? "Any command, e.g. composer update" : "Any command, e.g. npm outdated"}
-              aria-label="Command to run"
-              className="w-full bg-transparent font-mono text-sm outline-none placeholder:text-muted"
-            />
+            <Search size={14} className="shrink-0 text-muted" aria-hidden />
+            <input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder={`Filter ${all.length} commands`} aria-label="Filter commands" className="w-full min-w-0 bg-transparent text-sm outline-none placeholder:text-muted" />
+            {filter && (
+              <button type="button" onClick={() => setFilter("")} aria-label="Clear filter" className="text-muted hover:text-fg">
+                <X size={13} />
+              </button>
+            )}
           </label>
-          <Button type="submit" variant="primary" disabled={!custom.trim() || !!running}>
-            <Play size={14} /> Run
-          </Button>
-          <Button
-            type="button"
-            disabled={!custom.trim()}
-            title="Keep it in Yours"
-            aria-label="Keep it in Yours"
-            onClick={() => {
-              saveYours.mutate([...yours, { name: custom.trim(), run: custom.trim() }]);
-              setCustom("");
-            }}
-          >
-            <Plus size={15} />
-          </Button>
-          <Button type="button" variant="ghost" onClick={() => list.refetch()} disabled={list.isFetching} aria-label="Look for commands again" title="Look for commands again">
+          <Button variant="ghost" onClick={() => list.refetch()} disabled={list.isFetching} aria-label="Look for commands again" title="Look for commands again">
             <RefreshCw size={14} className={clsx(list.isFetching && "animate-spin")} />
           </Button>
-        </form>
-      )}
-
-      {!compact && all.length > 8 && (
-        <label className="flex h-9 items-center gap-2 rounded-lg border border-line bg-surface px-3 focus-within:border-accent">
-          <Search size={14} className="text-muted" aria-hidden />
-          <input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder={`Filter ${all.length} commands`} aria-label="Filter commands" className="w-full bg-transparent text-sm outline-none placeholder:text-muted" />
-          {filter && (
-            <button type="button" onClick={() => setFilter("")} aria-label="Clear filter" className="text-muted hover:text-fg">
-              <X size={13} />
-            </button>
-          )}
-        </label>
+        </div>
       )}
 
       {list.isLoading && <p className="text-sm text-muted">Looking for commands…</p>}
@@ -392,7 +356,7 @@ export function CommandsPanel({ site, status, limit, onMore }: { site: Site; sta
             {p}
           </p>
         ))}
-      {list.data && all.length === 0 && <p className="text-sm text-muted">No commands found{compact ? "." : ". Run any command above, or keep your own with +."}</p>}
+      {list.data && all.length === 0 && <p className="text-sm text-muted">No commands found{compact ? "." : ". Type any command under the output, or keep your own with +."}</p>}
 
       <div className={clsx("space-y-3", !compact && "max-h-[26rem] overflow-y-auto pr-1")}>
         {groups.map(([group, commands]) => (
@@ -425,6 +389,17 @@ export function CommandsPanel({ site, status, limit, onMore }: { site: Site; sta
                       <Trash2 size={13} />
                     </button>
                   )}
+                  {onKeepRunning && !compact && (
+                    <button
+                      type="button"
+                      aria-label={`Keep ${c.name} running`}
+                      title="Keep it running (as a process)"
+                      onClick={() => onKeepRunning({ name: c.name, command: c.command })}
+                      className="rounded p-1 text-muted opacity-0 group-hover:opacity-100 hover:bg-surface-2 hover:text-accent-text focus:opacity-100"
+                    >
+                      <Forever size={14} />
+                    </button>
+                  )}
                   <Button size="sm" variant="soft" onClick={() => run.mutate({ label: c.name, command: c.command })} disabled={!!running} title={c.command} aria-label={`Run ${c.name}`}>
                     <Play size={12} /> Run
                   </Button>
@@ -443,8 +418,31 @@ export function CommandsPanel({ site, status, limit, onMore }: { site: Site; sta
   );
 }
 
+/**
+ * New output lines per process of a project while it isn't the one shown: the counts on
+ * its output tab and row. `viewing` resets to zero.
+ */
+export function useUnreadOutput(project: string, viewing: string) {
+  const [counts, setCounts] = useState<Record<string, number>>({});
+  const shown = useRef(viewing);
+  shown.current = viewing;
+  useEffect(() => {
+    setCounts((c) => (c[viewing] ? { ...c, [viewing]: 0 } : c));
+  }, [viewing]);
+  useEffect(() => {
+    const off = listen<AppOutput>("app-output", ({ payload }) => {
+      if (!payload.name.startsWith(`${project}/`) || payload.name === shown.current) return;
+      setCounts((c) => ({ ...c, [payload.name]: (c[payload.name] ?? 0) + 1 }));
+    });
+    return () => {
+      off.then((f) => f());
+    };
+  }, [project]);
+  return counts;
+}
+
 /** The project's output: its process and the commands run for it, live. */
-export function OutputPanel({ name, height = "max-h-96 min-h-40" }: { name: string; height?: string }) {
+export function OutputPanel({ name, height = "max-h-96 min-h-40", title, footer }: { name: string; height?: string; title?: ReactNode; footer?: ReactNode }) {
   const showLogs = useAppStore((s) => s.showLogs);
   const [lines, setLines] = useState<{ line: string; stream: string }[]>([]);
   const box = useRef<HTMLPreElement>(null);
@@ -467,9 +465,9 @@ export function OutputPanel({ name, height = "max-h-96 min-h-40" }: { name: stri
   }, [lines]);
 
   return (
-    <div className="overflow-hidden rounded-xl border border-white/10 bg-terminal">
+    <div className="min-w-0 overflow-hidden rounded-xl border border-white/10 bg-terminal">
       <div className="flex items-center gap-2 border-b border-white/10 px-3 py-1.5">
-        <span className="flex-1 text-xs font-semibold text-slate-300">Output</span>
+        {title ?? <span className="flex-1 text-xs font-semibold text-slate-300">Output</span>}
         <button type="button" onClick={() => setLines([])} disabled={lines.length === 0} className="rounded px-2 py-1 text-xs text-slate-400 hover:bg-white/10 hover:text-slate-200 disabled:opacity-40" title="Clear this view (the log file keeps it)">
           Clear
         </button>
@@ -483,7 +481,7 @@ export function OutputPanel({ name, height = "max-h-96 min-h-40" }: { name: stri
           const el = e.currentTarget;
           atEnd.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
         }}
-        className={clsx("scrollbar-none selectable overflow-auto px-3 py-2 font-mono text-[11.5px] leading-relaxed text-slate-300", height)}
+        className={clsx("scrollbar-none selectable overflow-y-auto px-3 py-2 font-mono text-[11.5px] leading-relaxed break-all whitespace-pre-wrap text-slate-300", height)}
       >
         {lines.length === 0 ? (
           <span className="text-slate-500">Output from the dev server and from commands shows here.</span>
@@ -495,6 +493,95 @@ export function OutputPanel({ name, height = "max-h-96 min-h-40" }: { name: stri
           ))
         )}
       </pre>
+      {footer}
     </div>
+  );
+}
+
+/**
+ * The terminal's prompt line, under the output: any command, run in the project with its
+ * PHP and Node. Play runs it (Stop while something runs), + keeps it in the Yours group.
+ */
+export function CommandPrompt({ site, status }: { site: Site; status?: AppStatus }) {
+  const queryClient = useQueryClient();
+  const notify = useAppStore((s) => s.notify);
+  const onError = (e: unknown) => notify("error", String(e));
+  const list = useQuery({ queryKey: ["project-commands", site.name], queryFn: () => api.projectCommands(site.name), staleTime: 5 * 60_000 });
+  const [command, setCommand] = useState("");
+  const history = useQuery({ queryKey: ["command-history", site.name], queryFn: () => api.commandHistory(site.name) });
+  // Earlier commands, newest first, each once; -1 is what's being typed.
+  const earlier = useMemo(() => [...new Set((history.data ?? []).map((r) => r.command))], [history.data]);
+  const [back, setBack] = useState(-1);
+  const draft = useRef("");
+  const running = status?.task ?? null;
+  const run = useMutation({
+    mutationFn: (c: string) => api.runProjectCommand(site.name, c, c),
+    onSuccess: () => {
+      setCommand("");
+      setBack(-1);
+    },
+    onError,
+  });
+  const recall = (step: 1 | -1) => {
+    const next = Math.max(-1, Math.min(earlier.length - 1, back + step));
+    if (next === back) return;
+    if (back === -1) draft.current = command;
+    setBack(next);
+    setCommand(next === -1 ? draft.current : earlier[next]);
+  };
+  const stop = useMutation({ mutationFn: () => api.stopProjectCommand(site.name), onError });
+  const keep = useMutation({
+    mutationFn: (c: string) =>
+      api.saveProjectCommands(site.name, [...(list.data?.commands ?? []).filter((x) => x.origin === "yours").map((x) => ({ name: x.name, run: x.command })), { name: c, run: c }]),
+    onSuccess: () => {
+      setCommand("");
+      queryClient.invalidateQueries({ queryKey: ["project-commands", site.name] });
+    },
+    onError,
+  });
+  const text = command.trim();
+  const icon = "flex size-7 shrink-0 items-center justify-center rounded-md text-slate-400 hover:bg-white/10 hover:text-slate-100 disabled:opacity-30 disabled:hover:bg-transparent";
+
+  return (
+    <form
+      className="flex items-center gap-1 border-t border-white/10 px-3 py-1.5"
+      onSubmit={(e) => {
+        e.preventDefault();
+        if (text && !running) run.mutate(text);
+      }}
+    >
+      <span className="font-mono text-sm text-emerald-400" aria-hidden>
+        $
+      </span>
+      <input
+        value={command}
+        onChange={(e) => {
+          setCommand(e.target.value);
+          setBack(-1);
+        }}
+        onKeyDown={(e) => {
+          if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+            e.preventDefault();
+            recall(e.key === "ArrowUp" ? 1 : -1);
+          }
+        }}
+        title="↑ and ↓ go through earlier commands"
+        placeholder={running ? `Running ${running}…` : site.language === "php" ? "composer update, php artisan migrate…" : "npm outdated, npx …"}
+        aria-label="Command to run"
+        className="h-8 min-w-0 flex-1 bg-transparent px-1.5 font-mono text-[12.5px] text-slate-100 outline-none placeholder:text-slate-500"
+      />
+      {running ? (
+        <button type="button" onClick={() => stop.mutate()} className={clsx(icon, "text-red-300")} title={`Stop ${running}`} aria-label={`Stop ${running}`}>
+          <Square size={12} className="fill-current" />
+        </button>
+      ) : (
+        <button type="submit" disabled={!text || run.isPending} className={clsx(icon, "text-emerald-400")} title="Run" aria-label="Run">
+          <Play size={14} className="fill-current" />
+        </button>
+      )}
+      <button type="button" disabled={!text || keep.isPending} onClick={() => keep.mutate(text)} className={icon} title="Keep it in Yours" aria-label="Keep it in Yours">
+        <Plus size={15} />
+      </button>
+    </form>
   );
 }

@@ -1,0 +1,50 @@
+schema: 1
+id: fastapi
+name: FastAPI
+description: A FastAPI app in main.py with interactive docs, run by Uvicorn and reloaded when you save.
+icon: zap
+color: teal
+duration: pip · under a minute
+requires:
+  python: "3.10"
+steps:
+  - name: Creating a virtual environment (.venv)
+    run: python -m venv .venv
+  - name: Installing FastAPI and Uvicorn
+    run: '{{venv.python}} -m pip install --disable-pip-version-check fastapi "uvicorn[standard]"'
+  - name: Creating main.py
+    write:
+      path: main.py
+      content: |
+        from fastapi import FastAPI
+
+        app = FastAPI(title="{{project}}")
+
+
+        @app.get("/")
+        def index():
+            return {"message": "Hello from {{project}}"}
+  - name: Writing requirements.txt
+    write:
+      path: requirements.txt
+      content: |
+        fastapi
+        uvicorn[standard]
+  - name: Ignoring the virtual environment in Git
+    write:
+      path: .gitignore
+      content: |
+        .venv/
+        __pycache__/
+  - id: git
+    optional: true
+    default: false
+    label: Initialise a Git repository
+    needs: [git]
+    git_init:
+      commit: New FastAPI project
+serve:
+  mode: dynamic
+  # --proxy-headers: links in the docs use https://{{domain}}, not the internal address.
+  command: "{{venv.python}} -m uvicorn main:app --reload --proxy-headers --host 127.0.0.1 --port {port}"
+done: Start it from the Sites page; it's served at {{url}}, with interactive docs at {{url}}/docs.

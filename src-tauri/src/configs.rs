@@ -170,7 +170,13 @@ pub fn write_tools(settings: &Settings, layout: &Layout) -> Result<()> {
     let php_str = |s: &str| format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"));
     if let Some(version) = &settings.versions.adminer {
         let default = servers.first().map_or_else(|| "127.0.0.1:3306".to_string(), |(_, addr)| addr.clone());
-        let options: String = servers
+        // Adminer also speaks PostgreSQL (pick it under System on the login form).
+        let mut adminer_servers = servers.clone();
+        if let Some(v) = settings.versions.get("postgres") {
+            let major = v.split('.').next().unwrap_or(v);
+            adminer_servers.push((format!("PostgreSQL {major}"), format!("127.0.0.1:{}", settings.ports.postgres)));
+        }
+        let options: String = adminer_servers
             .iter()
             .map(|(label, addr)| format!("{} => {}, ", php_str(addr), php_str(label)))
             .collect();
@@ -247,6 +253,7 @@ $cfg['VersionCheck'] = false;
         std::fs::write(dir.join(".user.ini"), "display_errors = Off\n")?;
     }
     write_phpredisadmin(settings, layout)?;
+    write_phppgadmin(settings, layout)?;
     Ok(())
 }
 
@@ -340,6 +347,9 @@ upload_tmp_dir = "{tmp}"
 ");
     ini.push_str(&crate::extensions::ini_lines(settings, layout, version));
     ini.push_str(&mail_directives(settings, layout));
+    ini.push_str(&dump_directives(settings, layout)?);
+    // Last: everything after a [PATH=] line belongs to that folder.
+    ini.push_str(&site_sections(settings, layout));
     let ini_path = etc.join("php.ini");
     std::fs::write(&ini_path, ini)?;
 
@@ -351,6 +361,61 @@ upload_tmp_dir = "{tmp}"
         std::fs::write(etc.join("php-fpm.conf"), fpm)?;
     }
     Ok(ini_path)
+}
+
+/// With "Catch dumps" on: the prepend file that turns on VarDumper's server mode, written
+/// to etc/php/dumps.php, and the line that loads it.
+fn dump_directives(settings: &Settings, layout: &Layout) -> Result<String> {
+    if !settings.catch_dumps {
+        return Ok(String::new());
+    }
+    let file = layout.etc("php").join("dumps.php");
+    std::fs::create_dir_all(layout.etc("php"))?;
+    std::fs::write(&file, crate::dumps::prepend_script(settings.ports.dumps))?;
+    Ok(format!("\n; dump() and dd() to LampRabit's Logs (Logs → Dumps)\nauto_prepend_file = \"{}\"\n", slash(&file)))
+}
+
+/// php.ini keys a site can set for itself, each with what its value has to look like.
+pub const SITE_INI: [(&str, &str); 4] = [
+    ("memory_limit", "size"),
+    ("upload_max_filesize", "size"),
+    ("max_execution_time", "seconds"),
+    ("display_errors", "switch"),
+];
+
+/// Whether `value` suits a site ini key: sizes like 512M (or -1), whole seconds, On/Off.
+pub fn site_ini_ok(key: &str, value: &str) -> bool {
+    let kind = SITE_INI.iter().find(|(k, _)| *k == key).map(|(_, kind)| *kind);
+    match kind {
+        Some("size") => value == "-1" || value.strip_suffix(['K', 'M', 'G']).unwrap_or(value).parse::<u32>().is_ok_and(|n| n > 0),
+        Some("seconds") => value.parse::<u32>().is_ok(),
+        Some("switch") => matches!(value, "On" | "Off"),
+        _ => false,
+    }
+}
+
+/// Each site's own PHP settings as a [PATH=<project>] section: php-cgi and php-fpm apply
+/// them to scripts in that folder and below (the CLI and FrankenPHP don't).
+fn site_sections(settings: &Settings, layout: &Layout) -> String {
+    let mut out = String::new();
+    for (name, own) in &settings.sites {
+        let dir = layout.www().join(name);
+        if (own.php_ini.is_empty() && !own.xdebug) || !dir.is_dir() {
+            continue;
+        }
+        out.push_str(&format!("\n; {name}'s own settings (Sites → {name} → Settings)\n[PATH={}]\n", slash(&dir)));
+        for (key, value) in own.php_ini.iter().filter(|(k, v)| site_ini_ok(k, v)) {
+            out.push_str(&format!("{key} = {value}\n"));
+            // Uploads also count against the request size.
+            if key == "upload_max_filesize" {
+                out.push_str(&format!("post_max_size = {value}\n"));
+            }
+        }
+        if own.xdebug {
+            out.push_str("xdebug.start_with_request = yes\n");
+        }
+    }
+    out
 }
 
 pub fn mariadb_home(settings: &Settings, layout: &Layout) -> Result<PathBuf> {
@@ -684,4 +749,436 @@ pub fn nginx_prefix(layout: &Layout) -> Result<PathBuf> {
         std::fs::create_dir_all(prefix.join(dir))?;
     }
     Ok(prefix)
+}
+
+/// The Java Tomcat runs on: the active version, if it's new enough for that Tomcat line
+/// (Tomcat 11 needs Java 17, 10.1 needs 11, 9 needs 8).
+pub fn tomcat_java(settings: &Settings, layout: &Layout, tomcat: &str) -> Result<PathBuf> {
+    let java = settings
+        .versions
+        .get("java")
+        .ok_or_else(|| Error::msg("Tomcat runs on Java. Install a Java version on the Services page (Languages → Java) first."))?;
+    let major = |v: &str| v.split('.').next().and_then(|m| m.parse::<u32>().ok()).unwrap_or(0);
+    let needs = match major(tomcat) {
+        11.. => 17,
+        10 => 11,
+        _ => 8,
+    };
+    if major(java) < needs {
+        return Err(Error::msg(format!(
+            "Tomcat {tomcat} needs Java {needs} or newer, and the active Java is {java}. Install a newer Java on the Services page, or use an older Tomcat."
+        )));
+    }
+    Ok(layout.bin("java", java).join("bin").join(exe("java")))
+}
+
+fn xml_attr(text: &str) -> String {
+    text.replace('&', "&amp;").replace('"', "&quot;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// Tomcat's server.xml: one `<Host>` per Java project, named after its domain, so the web
+/// servers proxy to one port and Tomcat picks the app by the Host header. Apps dropped into
+/// data/tomcat/webapps are served on localhost. Pure, so it can be compared with the file
+/// on disk to tell whether Tomcat needs a restart.
+pub fn render_tomcat(settings: &Settings, layout: &Layout, apps: &[(String, PathBuf)]) -> String {
+    let work = layout.tmp().join("tomcat").join("work");
+    let empty = layout.tmp().join("tomcat").join("empty");
+    let hosts: String = apps
+        .iter()
+        .map(|(domain, webapp)| {
+            format!(
+                "      <Host name=\"{domain}\" appBase=\"{empty}\" workDir=\"{work}\" autoDeploy=\"false\">\n        <Context path=\"\" docBase=\"{doc}\" reloadable=\"true\" />\n      </Host>\n",
+                domain = xml_attr(domain),
+                empty = xml_attr(&slash(&empty)),
+                work = xml_attr(&slash(&work.join(domain))),
+                doc = xml_attr(&slash(webapp)),
+            )
+        })
+        .collect();
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!-- Generated by LampRabit. Changes are overwritten on every start. -->
+<Server port="{shutdown}" address="127.0.0.1" shutdown="SHUTDOWN">
+  <Listener className="org.apache.catalina.startup.VersionLoggerListener" />
+  <Listener className="org.apache.catalina.core.JreMemoryLeakPreventionListener" />
+  <Listener className="org.apache.catalina.core.ThreadLocalLeakPreventionListener" />
+  <Service name="Catalina">
+    <Connector port="{http}" address="127.0.0.1" protocol="HTTP/1.1" connectionTimeout="20000" />
+    <Engine name="Catalina" defaultHost="localhost">
+      <Host name="localhost" appBase="{webapps}" workDir="{localwork}" unpackWARs="true" autoDeploy="true" />
+{hosts}    </Engine>
+  </Service>
+</Server>
+"#,
+        shutdown = settings.ports.tomcat_shutdown,
+        http = settings.ports.tomcat_http,
+        webapps = xml_attr(&slash(&layout.data("tomcat").join("webapps"))),
+        localwork = xml_attr(&slash(&work.join("localhost"))),
+    )
+}
+
+pub fn tomcat_base(layout: &Layout) -> PathBuf {
+    layout.etc("tomcat")
+}
+
+/// Sets up LampRabit's CATALINA_BASE (etc/tomcat): the install's conf files, copied fresh
+/// for the active version, with logs moved to logs/tomcat, and the generated server.xml.
+/// The install folder itself is never written to, so versions can be switched and removed.
+pub fn write_tomcat(settings: &Settings, layout: &Layout, apps: &[(String, PathBuf)]) -> Result<()> {
+    let version = settings.versions.get("tomcat").ok_or_else(|| Error::msg("Tomcat is not installed"))?;
+    let home = layout.bin("tomcat", version);
+    let conf = tomcat_base(layout).join("conf");
+    std::fs::create_dir_all(&conf)?;
+    let logs = layout.logs().join("tomcat");
+    for dir in [logs.clone(), layout.tmp().join("tomcat").join("temp"), layout.tmp().join("tomcat").join("empty"), layout.data("tomcat").join("webapps")] {
+        std::fs::create_dir_all(dir)?;
+    }
+    for entry in std::fs::read_dir(home.join("conf"))?.flatten() {
+        let name = entry.file_name();
+        if !entry.path().is_file() || name == "server.xml" {
+            continue;
+        }
+        if name == "logging.properties" {
+            let text = std::fs::read_to_string(entry.path())?.replace("${catalina.base}/logs", &slash(&logs));
+            std::fs::write(conf.join(&name), text)?;
+        } else {
+            std::fs::copy(entry.path(), conf.join(&name))?;
+        }
+    }
+    std::fs::write(conf.join("server.xml"), render_tomcat(settings, layout, apps))?;
+    Ok(())
+}
+
+/// Whether a running Tomcat was configured with a different list of apps.
+pub fn tomcat_stale(settings: &Settings, layout: &Layout, apps: &[(String, PathBuf)]) -> bool {
+    std::fs::read_to_string(tomcat_base(layout).join("conf").join("server.xml")).ok() != Some(render_tomcat(settings, layout, apps))
+}
+
+/// Each MongoDB major version keeps its own data folder (data/mongodb-8…): MongoDB only
+/// upgrades its files one major version at a time and never downgrades them.
+pub fn mongodb_data(settings: &Settings, layout: &Layout) -> PathBuf {
+    let major = settings.versions.get("mongodb").and_then(|v| v.split('.').next().map(str::to_string)).unwrap_or_default();
+    layout.data(&format!("mongodb-{major}"))
+}
+
+/// Each PostgreSQL major version keeps its own data folder (data/postgres-18…): a data
+/// folder only works with the major version that created it.
+pub fn postgres_data(settings: &Settings, layout: &Layout) -> PathBuf {
+    let major = settings.versions.get("postgres").and_then(|v| v.split('.').next().map(str::to_string)).unwrap_or_default();
+    layout.data(&format!("postgres-{major}"))
+}
+
+/// Creates the data folder on first start: UTF-8, no OS locale (the same on every
+/// machine), the `postgres` superuser, and no password for local connections (it only
+/// listens on 127.0.0.1).
+pub async fn init_postgres_data(settings: &Settings, layout: &Layout) -> Result<()> {
+    let data = postgres_data(settings, layout);
+    if data.join("PG_VERSION").exists() {
+        return Ok(());
+    }
+    if data.exists() && std::fs::read_dir(&data)?.next().is_some() {
+        return Err(Error::msg(format!("{} is not empty but isn't a PostgreSQL data folder; move it away to start fresh.", data.display())));
+    }
+    let version = settings.versions.get("postgres").ok_or_else(|| Error::msg("PostgreSQL is not installed"))?;
+    let home = layout.bin("postgres", version);
+    let mut cmd = tokio::process::Command::new(home.join("bin").join(exe("initdb")));
+    cmd.arg("-D").arg(&data).args(["-U", "postgres", "-A", "trust", "-E", "UTF8", "--no-locale"]).current_dir(&home);
+    crate::procgroup::prepare(&mut cmd);
+    let out = cmd.output().await?;
+    if !out.status.success() {
+        let _ = std::fs::remove_dir_all(&data);
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        let hint = if text.contains("root") || text.contains("administrative") {
+            " PostgreSQL refuses to run with administrator rights: start LampRabit normally, not as administrator."
+        } else {
+            ""
+        };
+        return Err(Error::msg(format!("Setting up PostgreSQL's data folder failed: {}{hint}", text.trim())));
+    }
+    Ok(())
+}
+
+/// phpPgAdmin's config: its shipped defaults with LampRabit's PostgreSQL as the server, and
+/// logins without a password allowed (the server only listens on 127.0.0.1 and trusts
+/// local connections). Written on every web server start.
+pub fn write_phppgadmin(settings: &Settings, layout: &Layout) -> Result<()> {
+    let Some(version) = settings.versions.get("phppgadmin") else { return Ok(()) };
+    let conf = layout.bin("phppgadmin", version).join("conf");
+    let dist = std::fs::read_to_string(conf.join("config.inc.php-dist")).unwrap_or_else(|_| "<?php\n".into());
+    let dist = dist.trim_end().trim_end_matches("?>").to_string();
+    let pg = settings.versions.get("postgres");
+    let bin = pg.map(|v| layout.bin("postgres", v).join("bin"));
+    let tool = |name: &str| bin.as_ref().map(|b| slash(&b.join(exe(name)))).unwrap_or_default();
+    let label = pg.and_then(|v| v.split('.').next()).map_or("PostgreSQL".to_string(), |m| format!("PostgreSQL {m}"));
+    let php_str = |s: &str| format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"));
+    let config = format!(
+        "{dist}\n\n// Added by LampRabit; regenerated on every web server start.\n$conf['servers'][0]['desc'] = {desc};\n$conf['servers'][0]['host'] = '127.0.0.1';\n$conf['servers'][0]['port'] = {port};\n$conf['servers'][0]['sslmode'] = 'disable';\n$conf['servers'][0]['defaultdb'] = 'postgres';\n$conf['servers'][0]['pg_dump_path'] = {dump};\n$conf['servers'][0]['pg_dumpall_path'] = {dumpall};\n$conf['extra_login_security'] = false;\n$conf['owned_only'] = false;\n",
+        desc = php_str(&label),
+        port = settings.ports.postgres,
+        dump = php_str(&tool("pg_dump")),
+        dumpall = php_str(&tool("pg_dumpall")),
+    );
+    std::fs::write(conf.join("config.inc.php"), config)?;
+    Ok(())
+}
+
+/// pgAdmin's config_local.py, next to its config.py: desktop mode (no pgAdmin login) on
+/// 127.0.0.1, its data in data/pgadmin and its log in logs/, and settings for running
+/// behind LampRabit's web server at pgadmin.test.
+pub fn write_pgadmin(settings: &Settings, layout: &Layout, package: &Path) -> Result<()> {
+    let data = layout.data("pgadmin");
+    std::fs::create_dir_all(&data)?;
+    let py = |p: &Path| format!("'{}'", slash(p).replace('\'', "\\'"));
+    let config = format!(
+        "# Generated by LampRabit. Changes are overwritten on every start.\nimport os\n\nSERVER_MODE = False\nDEFAULT_SERVER = '127.0.0.1'\nDEFAULT_SERVER_PORT = {port}\nDATA_DIR = {data}\nLOG_FILE = {log}\nSQLITE_PATH = os.path.join(DATA_DIR, 'pgadmin4.db')\nSESSION_DB_PATH = os.path.join(DATA_DIR, 'sessions')\nSTORAGE_DIR = os.path.join(DATA_DIR, 'storage')\nAZURE_CREDENTIAL_CACHE_DIR = os.path.join(DATA_DIR, 'azurecredentialcache')\nKERBEROS_CCACHE_DIR = os.path.join(DATA_DIR, 'krbccache')\nMASTER_PASSWORD_REQUIRED = False\nUPGRADE_CHECK_ENABLED = False\n# Behind LampRabit's web server (https://pgadmin.test proxies to this port).\nPROXY_X_FOR_COUNT = 1\nPROXY_X_PROTO_COUNT = 1\nPROXY_X_HOST_COUNT = 1\nENHANCED_COOKIE_PROTECTION = False\nWTF_CSRF_SSL_STRICT = False\n",
+        port = settings.ports.pgadmin,
+        data = py(&data),
+        log = py(&layout.logs().join("pgadmin.log")),
+    );
+    std::fs::write(package.join("config_local.py"), config)?;
+    Ok(())
+}
+
+/// Elasticsearch's or OpenSearch's config folder (ES_PATH_CONF / OPENSEARCH_PATH_CONF):
+/// the install's config files, copied fresh, with LampRabit's settings on top: one node
+/// on 127.0.0.1, its data in data/<id>, security off (local only), 512 MB of heap, and no
+/// read-only switch when the disk gets full.
+pub fn write_search_engine(settings: &Settings, layout: &Layout, id: &str) -> Result<PathBuf> {
+    let version = settings.versions.get(id).ok_or_else(|| Error::msg(format!("{id} is not installed")))?;
+    let home = layout.bin(id, version);
+    let etc = layout.etc(id);
+    copy_dir(&home.join("config"), &etc)?;
+    for dir in [layout.data(id), layout.logs().join(id)] {
+        std::fs::create_dir_all(dir)?;
+    }
+    let (http, transport, name) = if id == "opensearch" {
+        (settings.ports.opensearch, settings.ports.opensearch_transport, "opensearch.yml")
+    } else {
+        (settings.ports.elasticsearch, settings.ports.elasticsearch_transport, "elasticsearch.yml")
+    };
+    let security = if id == "opensearch" {
+        "plugins.security.disabled: true\n"
+    } else {
+        "xpack.security.enabled: false\nxpack.security.enrollment.enabled: false\nxpack.ml.enabled: false\ningest.geoip.downloader.enabled: false\n"
+    };
+    let yml = format!(
+        "# Generated by LampRabit. Changes are overwritten on every start.\ncluster.name: lamprabit\nnode.name: lamprabit\npath.data: \"{data}\"\npath.logs: \"{logs}\"\nnetwork.host: 127.0.0.1\nhttp.port: {http}\ntransport.port: {transport}\ndiscovery.type: single-node\ncluster.routing.allocation.disk.threshold_enabled: false\n{security}",
+        data = slash(&layout.data(id)),
+        logs = slash(&layout.logs().join(id)),
+    );
+    std::fs::write(etc.join(name), yml)?;
+    std::fs::create_dir_all(etc.join("jvm.options.d"))?;
+    std::fs::write(etc.join("jvm.options.d").join("lamprabit.options"), "# Set by LampRabit: enough for local development.\n-Xms512m\n-Xmx512m\n")?;
+    Ok(etc)
+}
+
+/// Copies a folder's files (and subfolders), replacing what's there.
+fn copy_dir(from: &Path, to: &Path) -> Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)?.flatten() {
+        let target = to.join(entry.file_name());
+        if entry.path().is_dir() {
+            copy_dir(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
+}
+
+/// RabbitMQ's config and plugins (in etc/rabbitmq): AMQP and the management console on
+/// 127.0.0.1 only.
+pub fn write_rabbitmq(settings: &Settings, layout: &Layout) -> Result<PathBuf> {
+    let etc = layout.etc("rabbitmq");
+    std::fs::create_dir_all(&etc)?;
+    for dir in [layout.data("rabbitmq"), layout.logs().join("rabbitmq")] {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(
+        etc.join("rabbitmq.conf"),
+        format!(
+            "# Generated by LampRabit. Changes are overwritten on every start.\nlisteners.tcp.default = 127.0.0.1:{}\nmanagement.tcp.ip = 127.0.0.1\nmanagement.tcp.port = {}\n",
+            settings.ports.rabbitmq, settings.ports.rabbitmq_management
+        ),
+    )?;
+    std::fs::write(etc.join("enabled_plugins"), "[rabbitmq_management].\n")?;
+    Ok(etc)
+}
+
+/// ClickHouse's config and users: only on 127.0.0.1, data in data/clickhouse, logs to the
+/// console (LampRabit's log), and the `default` user without a password.
+pub fn write_clickhouse(settings: &Settings, layout: &Layout) -> Result<PathBuf> {
+    let etc = layout.etc("clickhouse");
+    let data = layout.data("clickhouse");
+    std::fs::create_dir_all(&etc)?;
+    std::fs::create_dir_all(&data)?;
+    let dir = |p: PathBuf| format!("{}/", slash(&p));
+    let config = format!(
+        r#"<!-- Generated by LampRabit. Changes are overwritten on every start. -->
+<clickhouse>
+    <logger>
+        <level>warning</level>
+        <console>1</console>
+    </logger>
+    <listen_host>127.0.0.1</listen_host>
+    <http_port>{http}</http_port>
+    <tcp_port>{tcp}</tcp_port>
+    <path>{data}</path>
+    <tmp_path>{tmp}</tmp_path>
+    <user_files_path>{files}</user_files_path>
+    <format_schema_path>{schemas}</format_schema_path>
+    <user_directories>
+        <users_xml>
+            <path>users.xml</path>
+        </users_xml>
+    </user_directories>
+    <mlock_executable>false</mlock_executable>
+</clickhouse>
+"#,
+        http = settings.ports.clickhouse_http,
+        tcp = settings.ports.clickhouse_tcp,
+        data = dir(data.clone()),
+        tmp = dir(layout.tmp().join("clickhouse")),
+        files = dir(data.join("user_files")),
+        schemas = dir(data.join("format_schemas")),
+    );
+    std::fs::write(etc.join("config.xml"), config)?;
+    std::fs::write(
+        etc.join("users.xml"),
+        "<!-- Generated by LampRabit. -->\n<clickhouse>\n    <profiles><default/></profiles>\n    <quotas><default/></quotas>\n    <users>\n        <default>\n            <password></password>\n            <networks><ip>127.0.0.1</ip><ip>::1</ip></networks>\n            <profile>default</profile>\n            <quota>default</quota>\n            <access_management>1</access_management>\n        </default>\n    </users>\n</clickhouse>\n",
+    )?;
+    Ok(etc.join("config.xml"))
+}
+
+/// The settings LampRabit gives Neo4j: only on 127.0.0.1, its data in data/neo4j and logs
+/// in logs/neo4j, plain HTTP, and no login (like the other local databases).
+fn neo4j_overrides(settings: &Settings, layout: &Layout) -> Vec<(&'static str, String)> {
+    vec![
+        ("server.default_listen_address", "127.0.0.1".into()),
+        ("server.bolt.listen_address", format!(":{}", settings.ports.neo4j_bolt)),
+        ("server.http.listen_address", format!(":{}", settings.ports.neo4j_http)),
+        ("server.https.enabled", "false".into()),
+        ("dbms.security.auth_enabled", "false".into()),
+        ("server.directories.data", slash(&layout.data("neo4j"))),
+        ("server.directories.logs", slash(&layout.logs().join("neo4j"))),
+        ("server.directories.run", slash(&layout.tmp().join("neo4j"))),
+    ]
+}
+
+/// Neo4j's config folder (NEO4J_CONF, etc/neo4j): the install's neo4j.conf without the
+/// settings LampRabit sets, then LampRabit's. Paths in it stay relative to the install.
+pub fn write_neo4j(settings: &Settings, layout: &Layout) -> Result<PathBuf> {
+    let version = settings.versions.get("neo4j").ok_or_else(|| Error::msg("Neo4j is not installed"))?;
+    let home = layout.bin("neo4j", version);
+    let etc = layout.etc("neo4j");
+    std::fs::create_dir_all(&etc)?;
+    for dir in [layout.data("neo4j"), layout.logs().join("neo4j"), layout.tmp().join("neo4j")] {
+        std::fs::create_dir_all(dir)?;
+    }
+    let overrides = neo4j_overrides(settings, layout);
+    let shipped = std::fs::read_to_string(home.join("conf").join("neo4j.conf")).unwrap_or_default();
+    let mut conf: String = shipped
+        .lines()
+        .filter(|l| !overrides.iter().any(|(k, _)| l.trim_start().starts_with(&format!("{k}="))))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    conf.push_str("\n# Added by LampRabit; regenerated on every start.\n");
+    for (key, value) in overrides {
+        conf.push_str(&format!("{key}={value}\n"));
+    }
+    std::fs::write(etc.join("neo4j.conf"), conf)?;
+    // Its logging configs are read from the config folder too.
+    for name in ["server-logs.xml", "user-logs.xml"] {
+        let src = home.join("conf").join(name);
+        if src.exists() {
+            std::fs::copy(src, etc.join(name))?;
+        }
+    }
+    Ok(etc)
+}
+
+/// Neo4j 5 and later run on Java 21 or newer.
+pub fn neo4j_java(settings: &Settings, layout: &Layout) -> Result<PathBuf> {
+    let java = settings
+        .versions
+        .get("java")
+        .ok_or_else(|| Error::msg("Neo4j runs on Java. Install Java 21 on the Services page (Languages → Java) first."))?;
+    let major = java.split('.').next().and_then(|m| m.parse::<u32>().ok()).unwrap_or(0);
+    if major < 21 {
+        return Err(Error::msg(format!("Neo4j needs Java 21 or newer, and the active Java is {java}. Install Java 21 on the Services page.")));
+    }
+    Ok(layout.bin("java", java))
+}
+
+/// Registers LampRabit's PostgreSQL in pgAdmin once, so it's in the tree on first open.
+pub async fn register_pgadmin_server(settings: &Settings, layout: &Layout, python: &Path, package: &Path) -> Result<()> {
+    let data = layout.data("pgadmin");
+    let marker = data.join("lamprabit-servers.json");
+    if marker.exists() || settings.versions.get("postgres").is_none() {
+        return Ok(());
+    }
+    let major = settings.versions.get("postgres").and_then(|v| v.split('.').next().map(str::to_string)).unwrap_or_default();
+    let servers = serde_json::json!({
+        "Servers": {
+            "1": {
+                "Name": format!("LampRabit PostgreSQL {major}"),
+                "Group": "LampRabit",
+                "Host": "127.0.0.1",
+                "Port": settings.ports.postgres,
+                "MaintenanceDB": "postgres",
+                "Username": "root",
+                "SSLMode": "disable",
+            }
+        }
+    });
+    std::fs::create_dir_all(&data)?;
+    let file = layout.tmp().join("pgadmin-servers.json");
+    std::fs::write(&file, servers.to_string())?;
+    let mut cmd = tokio::process::Command::new(python);
+    cmd.arg(package.join("setup.py")).arg("load-servers").arg(&file).current_dir(package).env("PGADMIN_SERVER_MODE", "OFF");
+    crate::procgroup::prepare(&mut cmd);
+    let out = cmd.output().await?;
+    let _ = std::fs::remove_file(&file);
+    if !out.status.success() {
+        return Err(Error::msg(String::from_utf8_lossy(&out.stderr).lines().last().unwrap_or("load-servers failed").to_string()));
+    }
+    std::fs::write(marker, servers.to_string())?;
+    Ok(())
+}
+
+/// FrankenPHP's PHP reads extra ini files from PHP_INI_SCAN_DIR: mail() to Mailpit and
+/// the same limits LampRabit's own php.ini uses.
+pub fn write_frankenphp_ini(settings: &Settings, layout: &Layout) -> Result<PathBuf> {
+    let dir = layout.etc("frankenphp").join("conf.d");
+    std::fs::create_dir_all(&dir)?;
+    let ini = format!(
+        "; Generated by LampRabit. Changes are overwritten on every start.\nmemory_limit = 512M\nupload_max_filesize = 128M\npost_max_size = 128M\nmax_execution_time = 300\ndisplay_errors = On\nerror_reporting = E_ALL\n{}{}",
+        mail_directives(settings, layout),
+        dump_directives(settings, layout)?
+    );
+    std::fs::write(dir.join("lamprabit.ini"), ini)?;
+    Ok(dir)
+}
+
+/// Frameworks default to the user `root` with no password (Laravel's .env, for one), like
+/// LampRabit's MySQL servers. PostgreSQL's superuser is `postgres`, so `root` is added as a
+/// second superuser once the server accepts connections. Safe to run on every start.
+pub async fn postgres_root_role(settings: &Settings, layout: &Layout) -> Result<()> {
+    let version = settings.versions.get("postgres").ok_or_else(|| Error::msg("PostgreSQL is not installed"))?;
+    let psql = layout.bin("postgres", version).join("bin").join(exe("psql"));
+    for _ in 0..60 {
+        if matches!(crate::diagnose::probe_postgres(settings.ports.postgres).await, crate::diagnose::Probe::Ok) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    let sql = "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'root') THEN CREATE ROLE root SUPERUSER LOGIN; END IF; END $$;";
+    let mut cmd = tokio::process::Command::new(psql);
+    cmd.args(["-h", "127.0.0.1", "-p", &settings.ports.postgres.to_string(), "-U", "postgres", "-d", "postgres", "-qtAc", sql]);
+    crate::procgroup::prepare(&mut cmd);
+    let out = cmd.output().await?;
+    if !out.status.success() {
+        return Err(Error::msg(String::from_utf8_lossy(&out.stderr).trim().to_string()));
+    }
+    Ok(())
 }

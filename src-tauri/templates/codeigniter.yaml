@@ -7,8 +7,9 @@ color: orange
 duration: Composer · about a minute
 requires:
   php: "8.1"
-  extensions: [intl, mbstring, mysqli]
+  extensions: [intl, mbstring]
 database: optional
+engines: [mariadb, mysql, postgres]
 steps:
   - create_database: {}
   - name: Creating the project with Composer (codeigniter4/appstarter)
@@ -36,6 +37,12 @@ steps:
         database.default.password: "{{db.password}}"
         database.default.DBDriver: MySQLi
         database.default.port: "{{db.port}}"
+  - name: Connecting the database
+    if: db.pdo == pgsql
+    env:
+      values:
+        database.default.DBDriver: Postgre
+        database.default.charset: utf8
   - id: git
     optional: true
     default: false

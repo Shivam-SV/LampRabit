@@ -2,7 +2,8 @@ import { create } from "zustand";
 import type { InstallProgress, LogHistory, LogService, RawLogLine } from "./api";
 import { parseLog, type LogEntry } from "./logparse";
 
-const MAX_LOG_LINES = 2000;
+// The Logs page draws only the rows in view, so it can keep this many.
+const MAX_LOG_LINES = 10000;
 const MAX_ACTIVITY = 100;
 
 export type PageId = "overview" | "sites" | "services" | "logs" | "settings";
@@ -11,6 +12,8 @@ export interface Notice {
   id: number;
   tone: "error" | "info";
   text: string;
+  /** Output lines shown under the text (a crash's last lines). */
+  detail?: string[];
 }
 
 export interface Activity {
@@ -35,6 +38,10 @@ interface AppStore {
   setDiagnosticsOpen: (open: boolean) => void;
   newProjectOpen: boolean;
   setNewProjectOpen: (open: boolean) => void;
+  /** The template editor: open on some YAML (a project's), and whether New project opened it. */
+  templateEditor: { yaml?: string; fromWizard?: boolean } | null;
+  openTemplateEditor: (editor: { yaml?: string; fromWizard?: boolean }) => void;
+  closeTemplateEditor: () => void;
   /** The keyboard shortcuts help ("?"). */
   shortcutsOpen: boolean;
   setShortcutsOpen: (open: boolean) => void;
@@ -55,13 +62,13 @@ interface AppStore {
   loadHistory: (history: LogHistory) => void;
   clearLogs: () => void;
   record: (text: string, source: string, tone: Activity["tone"]) => void;
-  notify: (tone: Notice["tone"], text: string) => void;
+  notify: (tone: Notice["tone"], text: string, detail?: string[]) => void;
   dismiss: (id: number) => void;
 }
 
 // View preferences remembered between launches. Storage can be unavailable; a choice
 // then lasts for this session only.
-function readPref(key: string): string | null {
+export function readPref(key: string): string | null {
   try {
     return localStorage.getItem(key);
   } catch {
@@ -69,7 +76,7 @@ function readPref(key: string): string | null {
   }
 }
 
-function writePref(key: string, value: string | null) {
+export function writePref(key: string, value: string | null) {
   try {
     if (value === null) localStorage.removeItem(key);
     else localStorage.setItem(key, value);
@@ -91,6 +98,9 @@ export const useAppStore = create<AppStore>((set) => ({
   setDiagnosticsOpen: (diagnosticsOpen) => set({ diagnosticsOpen }),
   newProjectOpen: false,
   setNewProjectOpen: (newProjectOpen) => set({ newProjectOpen }),
+  templateEditor: null,
+  openTemplateEditor: (templateEditor) => set({ templateEditor }),
+  closeTemplateEditor: () => set({ templateEditor: null }),
   shortcutsOpen: false,
   setShortcutsOpen: (shortcutsOpen) => set({ shortcutsOpen }),
   connMode: readPref("connMode") === "env" ? "env" : "url",
@@ -140,10 +150,11 @@ export const useAppStore = create<AppStore>((set) => ({
     set((s) => ({
       activity: [{ id: nextId++, at: new Date(), text, source, tone }, ...s.activity].slice(0, MAX_ACTIVITY),
     })),
-  notify: (tone, text) => {
+  notify: (tone, text, detail) => {
     const id = nextId++;
-    set((s) => ({ notices: [...s.notices, { id, tone, text }] }));
-    setTimeout(() => set((s) => ({ notices: s.notices.filter((n) => n.id !== id) })), 6000);
+    set((s) => ({ notices: [...s.notices, { id, tone, text, detail }] }));
+    // Ones with output stay longer, to be read.
+    setTimeout(() => set((s) => ({ notices: s.notices.filter((n) => n.id !== id) })), detail?.length ? 15000 : 6000);
   },
   dismiss: (id) => set((s) => ({ notices: s.notices.filter((n) => n.id !== id) })),
 }));

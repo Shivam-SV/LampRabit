@@ -18,7 +18,12 @@ export default function Notices() {
               : "border-line bg-surface text-fg",
           )}
         >
-          <span className="selectable flex-1 break-words">{n.text}</span>
+          <span className="selectable min-w-0 flex-1 break-words">
+            {n.text}
+            {n.detail && n.detail.length > 0 && (
+              <span className="mt-1.5 block rounded bg-terminal px-2 py-1.5 font-mono text-[11px] leading-snug break-all whitespace-pre-wrap text-slate-300">{n.detail.join("\n")}</span>
+            )}
+          </span>
           <button onClick={() => dismiss(n.id)} className="opacity-60 hover:opacity-100" aria-label="Dismiss">
             <X size={14} />
           </button>

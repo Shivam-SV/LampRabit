@@ -159,7 +159,7 @@ export function AvailableList({
                       style={{ width: r.progress === null ? "100%" : `${r.progress}%` }}
                     />
                   </div>
-                  <span className="w-16 text-right text-xs text-muted capitalize">{r.progress === null ? (r.stage ?? "Installing") : `${r.progress}%`}</span>
+                  <span className="w-20 text-right text-xs text-muted capitalize">{r.progress === null ? (r.stage ?? "Installing") : `${r.progress}%`}</span>
                 </div>
               ) : (
                 <Button size="sm" variant="soft" onClick={() => onInstall(r.version)} aria-label={`Install ${name} ${r.version}`}>

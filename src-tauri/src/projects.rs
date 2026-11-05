@@ -36,6 +36,9 @@ pub struct NewProject {
     pub ssl: bool,
     /// Database to create; None for no database.
     pub database: Option<String>,
+    /// The server to create it on; the default database when absent.
+    #[serde(default)]
+    pub engine: Option<crate::templates::DbEngine>,
     /// Values for the template's variables, by id.
     #[serde(default)]
     pub variables: HashMap<String, String>,
@@ -59,6 +62,10 @@ pub struct Built {
     pub note: Option<String>,
     /// A Node project's run setup (without its port, which the caller picks).
     pub app: Option<crate::config::NodeApp>,
+    /// The template's processes; port Some(0) means "pick a free one".
+    pub processes: Vec<crate::config::ProjectProcess>,
+    /// The template's subdomains, by their first label.
+    pub domains: Vec<(String, crate::config::DomainTarget)>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -150,7 +157,8 @@ async fn run(ctx: &Ctx<'_>, program: &Path, args: &[String], cwd: &Path, extra_p
         // Large dependency trees (Magento) need more than PHP's default memory limit.
         .env("COMPOSER_MEMORY_LIMIT", "-1")
         // npx and `npm create` otherwise ask before downloading a package.
-        .env("npm_config_yes", "true");
+        .env("npm_config_yes", "true")
+        .envs(crate::shims::tool_env(ctx.settings, ctx.layout));
     // PHP that a step starts by itself (Composer scripts, `php artisan serve`) gets no -c;
     // PHPRC points it at LampRabit's php.ini for the step's PHP version.
     let php_bins = ctx.layout.bin("php", "_");
@@ -232,7 +240,7 @@ async fn ensure_composer(ctx: &Ctx<'_>) -> Result<PathBuf> {
         return Ok(phar);
     }
     ctx.step("Installing Composer");
-    let release = runtimes::available(ctx.http, Runtime::Composer)
+    let release = runtimes::available(ctx.http, Runtime::Composer, false)
         .await?
         .into_iter()
         .next()
@@ -257,9 +265,48 @@ pub fn random_string(len: usize) -> String {
     out
 }
 
-/// Creates the database in the default database server (which must be running).
-pub async fn create_database(ctx: &Ctx<'_>, database: &str) -> Result<()> {
-    let db = ctx.settings.database().ok_or_else(|| Error::msg("Install MariaDB or MySQL first (Services)."))?;
+/// The server a project's database goes on: the one asked for, else the default database.
+pub fn engine(settings: &crate::config::Settings, req: &NewProject) -> Option<crate::templates::DbEngine> {
+    use crate::templates::DbEngine;
+    req.engine.or(match settings.database()? {
+        Database::Mariadb => Some(DbEngine::Mariadb),
+        Database::Mysql => Some(DbEngine::Mysql),
+    })
+}
+
+/// PostgreSQL's psql, connected to LampRabit's server as its superuser.
+fn psql(ctx: &Ctx<'_>) -> Result<(PathBuf, PathBuf, Vec<String>)> {
+    let version = ctx.settings.versions.get("postgres").ok_or_else(|| Error::msg("Install PostgreSQL first (Services)."))?;
+    let home = ctx.layout.bin("postgres", version);
+    let args = vec!["-h".into(), "127.0.0.1".into(), "-p".into(), ctx.settings.ports.postgres.to_string(), "-U".into(), "postgres".into(), "-d".into(), "postgres".into()];
+    Ok((home.join("bin").join(crate::layout::exe("psql")), home, args))
+}
+
+/// Creates the database on the project's server (which must be running).
+pub async fn create_database(ctx: &Ctx<'_>, req: &NewProject, database: &str) -> Result<()> {
+    use crate::templates::DbEngine;
+    // SQLite's database is a file the framework creates itself (Laravel does on install).
+    if engine(ctx.settings, req) == Some(DbEngine::Sqlite) {
+        return Ok(());
+    }
+    if engine(ctx.settings, req) == Some(DbEngine::Postgres) {
+        ctx.step(format!("Creating database {database} in PostgreSQL"));
+        let (client, home, mut args) = psql(ctx)?;
+        // template0 so the encoding can be set whatever template1 has.
+        args.extend(["-v".into(), "ON_ERROR_STOP=1".into(), "-c".into(), format!("CREATE DATABASE \"{database}\" ENCODING 'UTF8' TEMPLATE template0")]);
+        return run(ctx, &client, &args, &home, &[]).await.map_err(|e| {
+            if e.to_string().contains("already exists") {
+                Error::msg(format!("A database called {database} already exists. Choose another name, or leave the database option off and use the existing one yourself."))
+            } else {
+                e
+            }
+        });
+    }
+    let db = match req.engine {
+        Some(DbEngine::Mysql) => Database::Mysql,
+        Some(DbEngine::Mariadb) => Database::Mariadb,
+        _ => ctx.settings.database().ok_or_else(|| Error::msg("Install MariaDB or MySQL first (Services)."))?,
+    };
     ctx.step(format!("Creating database {database} in {}", db.label()));
     let home = configs::database_home(ctx.settings, ctx.layout, db)?;
     let client = configs::database_client(ctx.settings, ctx.layout, db)?;
@@ -282,7 +329,7 @@ pub async fn create_database(ctx: &Ctx<'_>, database: &str) -> Result<()> {
 /// Sets `KEY=value` lines in a .env-style file, adding the keys that are missing. Matches
 /// keys shipped commented out ("# DB_HOST=..." in Laravel, "# app.baseURL = ''" in
 /// CodeIgniter) and keeps the file's ` = ` spacing.
-fn set_env(path: &Path, values: &[(String, String)]) -> Result<()> {
+pub(crate) fn set_env(path: &Path, values: &[(String, String)]) -> Result<()> {
     let text = std::fs::read_to_string(path).unwrap_or_default();
     let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
     let spaced_file = lines.iter().any(|l| !l.trim_start().starts_with('#') && l.contains(" = "));
@@ -306,10 +353,19 @@ fn set_env(path: &Path, values: &[(String, String)]) -> Result<()> {
 
 /// Values for a template's placeholders: the project, its database and Mailpit.
 fn values(ctx: &Ctx<'_>, req: &NewProject, template: &Template, url: &str, php: Option<&str>, node: Option<(&str, &crate::apps::PmCommands)>) -> Values {
-    let server = ctx.settings.database().unwrap_or_default();
+    use crate::templates::DbEngine;
+    let engine = engine(ctx.settings, req).unwrap_or(DbEngine::Mariadb);
+    let server = if engine == DbEngine::Mysql { Database::Mysql } else { Database::Mariadb };
     // Doctrine tells the two apart by serverVersion: "11.8.9-MariaDB" or "8.4.13".
     let version = ctx.settings.database_version(server).cloned().unwrap_or_else(|| "8.0".into());
     let server_version = if server == Database::Mariadb { format!("{version}-MariaDB") } else { version };
+    let postgres_major = ctx.settings.versions.get("postgres").and_then(|v| v.split('.').next().map(str::to_string)).unwrap_or_else(|| "18".into());
+    // Laravel's connection names; Doctrine's URL schemes and charsets.
+    let (connection, port, server_version, scheme, charset, user) = match engine {
+        DbEngine::Postgres => ("pgsql".to_string(), ctx.settings.ports.postgres, postgres_major, "postgresql", "utf8", "root"),
+        DbEngine::Sqlite => ("sqlite".to_string(), 0, String::new(), "sqlite", "utf8", ""),
+        _ => (server.id().to_string(), ctx.settings.database_port(server), server_version, "mysql", "utf8mb4", "root"),
+    };
     let url = url.trim_end_matches('/').to_string();
     let domain = url.split("://").nth(1).unwrap_or(&url).to_string();
     let mut map = BTreeMap::from([
@@ -319,13 +375,34 @@ fn values(ctx: &Ctx<'_>, req: &NewProject, template: &Template, url: &str, php: 
         ("www".into(), ctx.layout.www().to_string_lossy().into()),
         ("dir".into(), ctx.dir().to_string_lossy().into()),
         ("php_version".into(), php.unwrap_or_default().into()),
-        ("database".into(), req.database.clone().unwrap_or_default()),
-        ("db.engine".into(), server.id().into()),
+        // SQLite: the file's path, where Laravel looks by default.
+        ("database".into(), if engine == DbEngine::Sqlite && req.database.is_some() {
+            ctx.dir().join("database").join("database.sqlite").to_string_lossy().replace('\\', "/")
+        } else {
+            req.database.clone().unwrap_or_default()
+        }),
+        ("db.engine".into(), connection),
         ("db.host".into(), "127.0.0.1".into()),
-        ("db.port".into(), ctx.settings.database_port(server).to_string()),
-        ("db.user".into(), "root".into()),
+        ("db.port".into(), port.to_string()),
+        ("db.user".into(), user.into()),
         ("db.password".into(), String::new()),
         ("db.server_version".into(), server_version),
+        ("db.scheme".into(), scheme.into()),
+        ("db.charset".into(), charset.into()),
+        // PDO's driver name (Drupal's too); empty without a database, so `if: db.pdo == pgsql`
+        // only holds when there is one.
+        ("db.pdo".into(), match (&req.database, engine) {
+            (None, _) => "",
+            (_, DbEngine::Postgres) => "pgsql",
+            (_, DbEngine::Sqlite) => "sqlite",
+            _ => "mysql",
+        }.into()),
+        // A project's virtual environment's Python, as each OS lays it out.
+        ("venv.python".into(), if cfg!(windows) { r".venv\Scripts\python.exe".into() } else { ".venv/bin/python".into() }),
+        // Maven's wrapper: a .cmd on Windows; elsewhere through sh, since zips drop the
+        // executable bit.
+        ("mvnw".into(), if cfg!(windows) { "mvnw.cmd".into() } else { "sh mvnw".into() }),
+        ("java_major".into(), ctx.settings.versions.get("java").and_then(|v| v.split('.').next().map(str::to_string)).unwrap_or_else(|| "21".into())),
         ("mail.host".into(), "127.0.0.1".into()),
         ("mail.port".into(), ctx.settings.ports.mail_smtp.to_string()),
     ]);
@@ -389,7 +466,7 @@ async fn has_tool(program: &str) -> bool {
 
 /// Everything a template needs, checked before anything is created: PHP version and
 /// extensions, and the tools its enabled steps use.
-async fn check_requirements(ctx: &Ctx<'_>, template: &Template, php: Option<&str>, steps: &[usize], path: &std::ffi::OsString) -> Result<()> {
+async fn check_requirements(ctx: &Ctx<'_>, req: &NewProject, template: &Template, php: Option<&str>, steps: &[usize], path: &std::ffi::OsString) -> Result<()> {
     if let (Some(minimum), Some(version)) = (template.requires.php.as_deref().filter(|m| *m != "any"), php) {
         if !at_least(version, minimum) {
             return Err(Error::msg(format!(
@@ -398,7 +475,20 @@ async fn check_requirements(ctx: &Ctx<'_>, template: &Template, php: Option<&str
             )));
         }
     }
-    if let (false, Some(version)) = (template.requires.extensions.is_empty(), php) {
+    // The drivers for the database picked in the wizard, so templates that support
+    // several engines don't have to list one engine's drivers for all of them.
+    let mut extensions = template.requires.extensions.clone();
+    if req.database.is_some() && template.engines.len() > 1 {
+        use crate::templates::DbEngine;
+        let drivers: &[&str] = match engine(ctx.settings, req) {
+            Some(DbEngine::Postgres) => &["pdo_pgsql", "pgsql"],
+            Some(DbEngine::Sqlite) => &["pdo_sqlite"],
+            Some(DbEngine::Mariadb | DbEngine::Mysql) => &["pdo_mysql", "mysqli"],
+            _ => &[],
+        };
+        extensions.extend(drivers.iter().map(|d| d.to_string()).filter(|d| !extensions.contains(d)).collect::<Vec<_>>());
+    }
+    if let (false, Some(version)) = (extensions.is_empty(), php) {
         let (php_bin, ini) = php_cli(ctx, version)?;
         let mut cmd = tokio::process::Command::new(&php_bin);
         cmd.arg("-c").arg(&ini).arg("-m");
@@ -406,13 +496,29 @@ async fn check_requirements(ctx: &Ctx<'_>, template: &Template, php: Option<&str
         let out = cmd.output().await.map_err(|e| Error::msg(format!("Couldn't run PHP {version}: {e}")))?;
         let loaded: Vec<String> = String::from_utf8_lossy(&out.stdout).lines().map(|l| l.trim().to_lowercase()).collect();
         let missing: Vec<&str> =
-            template.requires.extensions.iter().map(String::as_str).filter(|e| !loaded.iter().any(|l| *l == e.to_lowercase())).collect();
+            extensions.iter().map(String::as_str).filter(|e| !loaded.iter().any(|l| *l == e.to_lowercase())).collect();
         if !missing.is_empty() {
             return Err(Error::msg(format!(
                 "{} needs these PHP extensions, which PHP {version} doesn't load: {}. Turn them on in Services → PHP → Extensions.",
                 template.name,
                 missing.join(", ")
             )));
+        }
+    }
+    // Python and Java projects run on LampRabit's own versions (they're on PATH as shims).
+    for (id, label, minimum) in [
+        ("python", "Python", &template.requires.python),
+        ("java", "Java", &template.requires.java),
+        ("go", "Go", &template.requires.go),
+        ("rust", "Rust", &template.requires.rust),
+    ] {
+        let Some(minimum) = minimum else { continue };
+        match ctx.settings.versions.get(id) {
+            Some(have) if at_least(have, minimum) => {}
+            Some(have) => {
+                return Err(Error::msg(format!("{} needs {label} {minimum} or newer, and the active {label} is {have}. Switch to a newer one on the Services page.", template.name)));
+            }
+            None => return Err(Error::msg(format!("{} needs {label} {minimum} or newer. Install it on the Services page (Languages → {label}) first.", template.name))),
         }
     }
     let needs: std::collections::BTreeSet<&str> = steps.iter().flat_map(|&i| template.steps[i].needs.iter().map(String::as_str)).collect();
@@ -579,7 +685,7 @@ pub async fn build(ctx: &Ctx<'_>, req: &NewProject, template: &Template, source:
     let path_os = std::env::join_paths(path.iter().cloned().chain(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()))).unwrap_or_default();
 
     ctx.step("Checking requirements");
-    check_requirements(ctx, template, php_version.as_deref(), &steps, &path_os).await?;
+    check_requirements(ctx, req, template, php_version.as_deref(), &steps, &path_os).await?;
     let composer = match steps.iter().any(|&i| matches!(template.steps[i].action, Action::Composer(_))) {
         true => Some(ensure_composer(ctx).await?),
         false => None,
@@ -620,7 +726,8 @@ pub async fn build(ctx: &Ctx<'_>, req: &NewProject, template: &Template, source:
                 let bytes = download_checked(ctx, d, &values).await?;
                 let url = values.render(&d.url);
                 if d.extract {
-                    extract(ctx, bytes, &url, d.strip.as_deref(), &dir)?;
+                    let strip = d.strip.as_deref().map(|s| values.render(s));
+                    extract(ctx, bytes, &url, strip.as_deref(), &dir)?;
                 } else {
                     let target = file(d.to.as_deref().unwrap_or_else(|| url.rsplit('/').next().unwrap_or("download")))?;
                     parent_of(&target)?;
@@ -664,7 +771,7 @@ pub async fn build(ctx: &Ctx<'_>, req: &NewProject, template: &Template, source:
                 }
                 std::fs::write(&target, text)?;
             }
-            Action::CreateDatabase(_) => create_database(ctx, req.database.as_deref().unwrap_or_default()).await?,
+            Action::CreateDatabase(_) => create_database(ctx, req, req.database.as_deref().unwrap_or_default()).await?,
             Action::GitInit(g) => {
                 if !has_tool("git").await {
                     ctx.line("Git isn't installed; skipped the repository.");
@@ -694,7 +801,34 @@ pub async fn build(ctx: &Ctx<'_>, req: &NewProject, template: &Template, source:
         package_manager: req.package_manager,
         serve: a.mode == crate::config::ServeMode::Dynamic,
     });
-    Ok(Built { note: template.done.as_deref().map(|d| values.render(d)), app })
+    let holds = |when: &Option<String>| when.as_deref().is_none_or(|w| values.holds(w).unwrap_or(false));
+    let processes = template
+        .processes
+        .iter()
+        .filter(|p| holds(&p.when))
+        .map(|p| crate::config::ProjectProcess {
+            name: p.name.clone(),
+            command: values.render(&p.command),
+            cwd: values.render(&p.cwd),
+            port: match p.port.as_deref() {
+                Some("auto") => Some(0),
+                Some(n) => n.parse().ok(),
+                None => None,
+            },
+            env: p.env.iter().map(|(k, v)| (k.clone(), values.render(v))).collect(),
+            restart: p.restart,
+            with_app: p.autostart,
+            ..Default::default()
+        })
+        .collect::<Vec<_>>();
+    // A subdomain pointing at a process that was left out goes with it.
+    let domains = template
+        .domains
+        .iter()
+        .filter(|d| holds(&d.when) && d.process.as_ref().is_none_or(|p| processes.iter().any(|x| &x.name == p)))
+        .map(|d| (d.name.clone(), d.target()))
+        .collect();
+    Ok(Built { note: template.done.as_deref().map(|d| values.render(d)), app, processes, domains })
 }
 
 #[cfg(test)]

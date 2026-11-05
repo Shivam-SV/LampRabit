@@ -1,4 +1,6 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { PageActiveContext } from "./lib/pageActive";
+import PageBoundary from "./components/PageBoundary";
 import clsx from "clsx";
 import { openPath } from "@tauri-apps/plugin-opener";
 import { listen } from "@tauri-apps/api/event";
@@ -9,6 +11,7 @@ import {
   serviceLabels,
   type InstallProgress,
   type RawLogLine,
+  type Crash,
   type StatusEvent,
 } from "./lib/api";
 import { useAppStore } from "./lib/store";
@@ -23,6 +26,8 @@ import BottomNav from "./components/BottomNav";
 import Titlebar from "./components/Titlebar";
 import Diagnostics from "./components/Diagnostics";
 import NewProject from "./components/NewProject";
+import TemplateEditor from "./components/TemplateEditor";
+import FirstRunDialog from "./components/FirstRunDialog";
 import ShortcutsDialog from "./components/ShortcutsDialog";
 import { useHotkeys } from "./lib/shortcuts";
 import { useStack } from "./lib/stack";
@@ -44,6 +49,15 @@ function useBackendEvents() {
       }),
       listen("service-health", () => queryClient.invalidateQueries({ queryKey: ["services"] })),
       listen("tunnels-changed", () => queryClient.invalidateQueries({ queryKey: ["tunnels"] })),
+      // A project's process or dev server crashed: say so with its last lines, wherever you are.
+      listen<Crash>("process-crashed", ({ payload }) => {
+        const [project, process] = payload.name.split("/");
+        const who = process ? `${process} (${project})` : `${project}'s dev server`;
+        const code = payload.exitCode != null ? ` with exit code ${payload.exitCode}` : "";
+        const next = payload.gaveUp ? ". It crashed 3 times in a few minutes, so it's left stopped." : payload.restarting ? ", restarting it." : ".";
+        notify("error", `${who} crashed${code}${next}`, payload.lines);
+        record(`${who} crashed`, project, "error");
+      }),
       // A project's dev server came up or went away: its domain moved.
       listen<string[]>("routes-changed", ({ payload }) => {
         queryClient.invalidateQueries({ queryKey: ["sites"] });
@@ -105,38 +119,59 @@ function useGlobalShortcuts() {
   });
 }
 
+const pages: Record<PageId, ReactNode> = {
+  overview: <Overview />,
+  sites: <Sites />,
+  services: <Services />,
+  logs: <Logs />,
+  settings: <Settings />,
+};
+
 export default function App() {
   const page = useAppStore((s) => s.page);
   useGlobalShortcuts();
   useStartupUpdateCheck();
   const scroller = useRef<HTMLDivElement>(null);
   useBackendEvents();
-  useEffect(() => {
-    scroller.current?.scrollTo({ top: 0 });
+  // Pages stay mounted once visited, hidden when another is shown, so switching tabs keeps
+  // where you were: the selected service or project, open tabs, filters, unsaved edits.
+  const [visited, setVisited] = useState<PageId[]>([page]);
+  useEffect(() => setVisited((v) => (v.includes(page) ? v : [...v, page])), [page]);
+  // Each page's scroll position, put back when it's shown again.
+  const scrolls = useRef<Partial<Record<PageId, number>>>({});
+  useLayoutEffect(() => {
+    scroller.current?.scrollTo({ top: scrolls.current[page] ?? 0 });
   }, [page]);
 
   return (
     <div className="flex h-full flex-col">
       <Titlebar />
-      <div ref={scroller} className={clsx("min-h-0 flex-1 overflow-x-hidden", page === "logs" ? "overflow-hidden" : "overflow-y-auto")}>
-        <main
-          key={page}
-          className={clsx(
-            "motion-page mx-auto px-6 pt-8 pb-26 sm:px-10",
-            page === "overview" ? "max-w-[90rem]" : page === "logs" ? "h-full min-h-0 max-w-7xl overflow-hidden pt-4 pb-20" : "max-w-7xl",
-          )}
-        >
-          {page === "overview" && <Overview />}
-          {page === "sites" && <Sites />}
-          {page === "services" && <Services />}
-          {page === "logs" && <Logs />}
-          {page === "settings" && <Settings />}
-        </main>
+      <div
+        ref={scroller}
+        onScroll={(e) => (scrolls.current[page] = e.currentTarget.scrollTop)}
+        className={clsx("min-h-0 flex-1 overflow-x-hidden", page === "logs" ? "overflow-hidden" : "overflow-y-auto")}
+      >
+        {visited.map((id) => (
+          <main
+            key={id}
+            hidden={id !== page}
+            className={clsx(
+              "motion-page mx-auto px-6 pt-8 pb-26 sm:px-10",
+              id === "overview" ? "max-w-[90rem]" : id === "logs" ? "h-full min-h-0 max-w-7xl overflow-hidden pt-4 pb-20" : "max-w-7xl",
+            )}
+          >
+            <PageActiveContext.Provider value={id === page}>
+              <PageBoundary>{pages[id]}</PageBoundary>
+            </PageActiveContext.Provider>
+          </main>
+        ))}
       </div>
       <BottomNav />
       <Notices />
       <Diagnostics />
       <NewProject />
+      <TemplateEditor />
+      <FirstRunDialog />
       <ShortcutsDialog />
     </div>
   );

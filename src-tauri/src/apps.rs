@@ -14,7 +14,7 @@ use std::{
     time::Duration,
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -22,7 +22,7 @@ use tokio::{
 };
 
 use crate::{
-    config::{AppMode, NodeApp, PackageManager, Settings},
+    config::{AppMode, NodeApp, PackageManager, RestartPolicy, Settings},
     diagnose,
     error::{Error, Result},
     logs,
@@ -197,9 +197,13 @@ pub fn suggest(dir: &Path, port: u16) -> NodeApp {
     }
 }
 
-/// A free port from 3000 up that no other project uses.
+/// A free port from 3000 up that no other project's app or process uses.
 pub fn free_port(settings: &Settings) -> u16 {
-    let taken: Vec<u16> = settings.sites.values().filter_map(|s| s.app.as_ref().map(|a| a.port)).collect();
+    let taken: Vec<u16> = settings
+        .sites
+        .values()
+        .flat_map(|s| s.app.as_ref().map(|a| a.port).into_iter().chain(s.processes.iter().filter_map(|p| p.port)))
+        .collect();
     (3000..4000).find(|p| !taken.contains(p) && std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok()).unwrap_or(3000)
 }
 
@@ -234,6 +238,35 @@ pub struct AppOutput {
     pub stream: &'static str,
 }
 
+/// A command run for a project, kept in its run history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandRun {
+    pub label: String,
+    pub command: String,
+    /// Unix time in milliseconds it started.
+    pub started: u64,
+    pub duration_ms: u64,
+    /// None when it was stopped.
+    pub exit_code: Option<i32>,
+}
+
+/// A project's process (or dev server) that crashed: shown as an alert with its last lines.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Crash {
+    pub name: String,
+    pub exit_code: Option<i32>,
+    pub lines: Vec<String>,
+    /// Being restarted by its restart policy.
+    pub restarting: bool,
+    /// Crashed too often in a few minutes, so it's left stopped.
+    pub gave_up: bool,
+}
+
+/// Runs kept per project.
+const HISTORY: usize = 30;
+
 /// Log files are trimmed to their last half when they pass this size.
 const LOG_FILE_MAX: u64 = 2 * 1024 * 1024;
 
@@ -248,12 +281,39 @@ struct Entry {
     stopping: bool,
     /// Bumped per start, so tasks of an earlier run don't touch a newer one.
     run: u64,
+    /// When a project process was restarted after exiting (ms), for `RESTARTS_IN_WINDOW`.
+    restarts: Vec<u64>,
 }
 
 impl Entry {
     fn new(name: &str) -> Self {
-        Self { status: AppStatus::stopped(name), group: None, task_group: None, task_run: 0, log: VecDeque::new(), stopping: false, run: 0 }
+        Self { status: AppStatus::stopped(name), group: None, task_group: None, task_run: 0, log: VecDeque::new(), stopping: false, run: 0, restarts: Vec::new() }
     }
+}
+
+/// A process that exits more often than this within `RESTART_WINDOW` is left stopped, so a
+/// command that can't run doesn't loop forever.
+const RESTARTS_IN_WINDOW: usize = 3;
+const RESTART_WINDOW_MS: u64 = 5 * 60 * 1000;
+
+/// The name a project's process goes by in statuses, logs and the Logs page: "shop/queue".
+/// Folder names can't hold a slash, so it never clashes with a project.
+pub fn process_key(project: &str, process: &str) -> String {
+    format!("{project}/{process}")
+}
+
+/// Processes to start again after they exited, as (project, process). The restart needs
+/// fresh settings, which the exit watcher doesn't have, so lib.rs's loop does it
+/// (`restart_requests`).
+static RESTARTS: std::sync::LazyLock<(tokio::sync::mpsc::UnboundedSender<(String, String)>, std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<(String, String)>>>)> =
+    std::sync::LazyLock::new(|| {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (tx, std::sync::Mutex::new(Some(rx)))
+    });
+
+/// The restart requests; can be taken once.
+pub fn restart_requests() -> Option<tokio::sync::mpsc::UnboundedReceiver<(String, String)>> {
+    RESTARTS.1.lock().ok()?.take()
 }
 
 #[derive(Default, Clone)]
@@ -261,8 +321,27 @@ pub struct Apps {
     entries: Arc<Mutex<HashMap<String, Entry>>>,
 }
 
+fn history_file(layout: &Layout, name: &str) -> PathBuf {
+    layout.logs().join("apps").join(format!("{name}.runs.json"))
+}
+
+/// A project's recent command runs, newest first.
+pub fn history(layout: &Layout, name: &str) -> Vec<CommandRun> {
+    std::fs::read_to_string(history_file(layout, name)).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+}
+
+fn remember(layout: &Layout, name: &str, run: CommandRun) {
+    let mut runs = history(layout, name);
+    runs.insert(0, run);
+    runs.truncate(HISTORY);
+    if let Ok(text) = serde_json::to_string(&runs) {
+        let _ = std::fs::write(history_file(layout, name), text);
+    }
+}
+
 fn log_file(layout: &Layout, name: &str) -> PathBuf {
-    layout.logs().join("apps").join(format!("{name}.log"))
+    // A process's "shop/queue" is a file next to the project's, not a folder.
+    layout.logs().join("apps").join(format!("{}.log", name.replace('/', "~")))
 }
 
 impl Apps {
@@ -330,6 +409,16 @@ impl Apps {
         logs::push_project(app, name, stream, stamped);
     }
 
+    /// Tells the UI a process crashed, with its last few lines of output.
+    async fn report_crash(&self, app: &AppHandle, name: &str, exit_code: Option<i32>, restarting: bool, gave_up: bool) {
+        let lines: Vec<String> = {
+            let entries = self.entries.lock().await;
+            let log = entries.get(name).map(|e| e.log.iter().filter(|l| !l.contains("] command: ")).cloned().collect::<Vec<_>>()).unwrap_or_default();
+            log[log.len().saturating_sub(4)..].iter().map(|l| l.split_once(": ").map_or(l.as_str(), |(_, rest)| rest).to_string()).collect()
+        };
+        let _ = app.emit("process-crashed", Crash { name: name.to_string(), exit_code, lines, restarting, gave_up });
+    }
+
     /// Streams a process's stdout or stderr into the project's output.
     fn pipe(&self, app: &AppHandle, layout: &Layout, name: &str, stream: &'static str, reader: impl tokio::io::AsyncRead + Unpin + Send + 'static) {
         let (apps, app, layout, name) = (self.clone(), app.clone(), layout.clone(), name.to_string());
@@ -368,15 +457,20 @@ impl Apps {
             return Ok(self.status(name).await);
         }
         let dir = layout.www().join(name);
-        if !dir.join("package.json").exists() && config.mode == AppMode::Command {
-            return Err(Error::msg(format!("www/{name} has no package.json.")));
-        }
+        // Python and Java projects run their command with LampRabit's commands on PATH; Node
+        // ones (and `node <file>`) with the project's Node version first.
+        let node_project = dir.join("package.json").exists() || config.mode == AppMode::File;
         if std::net::TcpListener::bind(("127.0.0.1", config.port)).is_err() {
             let owner = diagnose::port_owner(config.port).await.map(|o| format!(" by {} (PID {})", o.name, o.pid)).unwrap_or_default();
             return Err(Error::msg(format!("Port {} is already in use{owner}. Stop that program, or choose another port for {name}.", config.port)));
         }
-        let (version, bin) = node::for_project(config.node.as_deref(), &dir)?;
-        let path = node_path(&bin, layout);
+        let (version, bin, path) = if node_project {
+            let (version, bin) = node::for_project(config.node.as_deref(), &dir)?;
+            let path = node_path(&bin, layout);
+            (version, bin, path)
+        } else {
+            (Default::default(), PathBuf::new(), Self::command_path(settings, layout, name))
+        };
         let (program, args) = match config.mode {
             AppMode::Command => {
                 let command = config.command.trim();
@@ -407,6 +501,7 @@ impl Apps {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .env("PATH", &path)
+            .envs(crate::shims::tool_env(settings, layout))
             .env("PORT", config.port.to_string())
             // Dev servers that read HOST bind where the proxy looks.
             .env("HOST", "127.0.0.1")
@@ -449,16 +544,21 @@ impl Apps {
                 Some(c) => format!("The app exited with code {c}"),
             };
             apps.record(&handle, &layout_c, &n, "command", note).await;
+            let mut crashed = false;
             apps.update(&handle, &n, |e| {
                 if e.run != run {
                     return;
                 }
                 e.group = None;
                 e.status.state = if e.stopping || code == Some(0) { "stopped" } else { "crashed" };
+                crashed = e.status.state == "crashed";
                 e.status.exit_code = code;
                 e.status.pid = None;
             })
             .await;
+            if crashed {
+                apps.report_crash(&handle, &n, code, false, false).await;
+            }
         });
         // Ready: the port answers. A process that isn't served (an asset dev server) may
         // listen elsewhere, so it counts as running once started.
@@ -492,6 +592,188 @@ impl Apps {
             }
         });
         Ok(self.status(name).await)
+    }
+
+    /// Starts one of a project's processes (`SiteSettings.processes`) in the project folder,
+    /// with the project's Node and LampRabit's commands on PATH. It's restarted after
+    /// exiting when its policy says so, a few times in a row at most.
+    pub async fn start_process(&self, app: &AppHandle, settings: &Settings, layout: &Layout, project: &str, process: &str) -> Result<AppStatus> {
+        let key = process_key(project, process);
+        let config = settings
+            .sites
+            .get(project)
+            .and_then(|s| s.processes.iter().find(|p| p.name == process).cloned())
+            .ok_or_else(|| Error::msg(format!("{project} has no process called {process}.")))?;
+        if matches!(self.status(&key).await.state, "starting" | "running") {
+            return Ok(self.status(&key).await);
+        }
+        let command = config.command.trim();
+        if command.is_empty() {
+            return Err(Error::msg(format!("Enter the command {process} runs, such as php artisan queue:work.")));
+        }
+        if let Some(port) = config.port {
+            if std::net::TcpListener::bind(("127.0.0.1", port)).is_err() {
+                let owner = diagnose::port_owner(port).await.map(|o| format!(" by {} (PID {})", o.name, o.pid)).unwrap_or_default();
+                return Err(Error::msg(format!("Port {port} is already in use{owner}. Stop that program, or give {process} another port.")));
+            }
+        }
+        let dir = layout.www().join(project).join(&config.cwd);
+        if !dir.is_dir() {
+            return Err(Error::msg(format!("{process} runs in {project}/{}, which doesn't exist. Pick another folder for it.", config.cwd)));
+        }
+        let path = Self::command_path(settings, layout, project);
+        let command = match config.port {
+            Some(port) => command.replace("{port}", &port.to_string()),
+            None => command.to_string(),
+        };
+        let (program, args) = shell(&command);
+        std::fs::create_dir_all(logs::project_dir(&layout.logs()))?;
+        Self::trim_log(layout, &key);
+        let mut cmd = tokio::process::Command::new(&program);
+        cmd.args(&args)
+            .current_dir(&dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .env("PATH", &path)
+            .envs(crate::shims::tool_env(settings, layout))
+            .env("HOST", "127.0.0.1")
+            .env("BROWSER", "none")
+            .env("FORCE_COLOR", "0")
+            .env("npm_config_yes", "true")
+            .envs(config.port.map(|p| ("PORT", p.to_string())))
+            .envs(&config.env);
+        procgroup::prepare(&mut cmd);
+        let mut child = cmd.spawn().map_err(|e| Error::msg(format!("Couldn't start {process}: {e}")))?;
+        let group = ProcGroup::attach(&child).ok();
+        let pid = child.id();
+        let mut run = 0;
+        self.update(app, &key, |e| {
+            e.run += 1;
+            run = e.run;
+            e.group = group;
+            e.stopping = false;
+            let state = if config.port.is_some() { "starting" } else { "running" };
+            e.status = AppStatus { name: key.clone(), state, pid, port: config.port, since: Some(diagnose::now_ms()), node: None, exit_code: None, task: None };
+        })
+        .await;
+        self.record(app, layout, &key, "command", format!("$ {command}")).await;
+        if let Some(out) = child.stdout.take() {
+            self.pipe(app, layout, &key, "output", out);
+        }
+        if let Some(err) = child.stderr.take() {
+            self.pipe(app, layout, &key, "error", err);
+        }
+
+        let (apps, handle, k, layout_c, project_c, process_c) = (self.clone(), app.clone(), key.clone(), layout.clone(), project.to_string(), process.to_string());
+        tauri::async_runtime::spawn(async move {
+            let code = child.wait().await.ok().and_then(|s| s.code());
+            let stopping = apps.entries.lock().await.get(&k).is_some_and(|e| e.run == run && e.stopping);
+            let again = !stopping
+                && match config.restart {
+                    RestartPolicy::Never => false,
+                    RestartPolicy::OnFailure => code != Some(0),
+                    RestartPolicy::Always => true,
+                };
+            // Room for another restart: fewer than RESTARTS_IN_WINDOW in the last few minutes.
+            let now = diagnose::now_ms();
+            let mut allowed = false;
+            apps.update(&handle, &k, |e| {
+                if e.run != run {
+                    return;
+                }
+                e.group = None;
+                e.status.state = if stopping || code == Some(0) { "stopped" } else { "crashed" };
+                e.status.exit_code = code;
+                e.status.pid = None;
+                e.restarts.retain(|t| now.saturating_sub(*t) < RESTART_WINDOW_MS);
+                if again && e.restarts.len() < RESTARTS_IN_WINDOW {
+                    e.restarts.push(now);
+                    allowed = true;
+                }
+            })
+            .await;
+            let note = match code {
+                Some(c) => format!("{process_c} exited with code {c}"),
+                None => format!("{process_c} stopped"),
+            };
+            let crashed = !stopping && code != Some(0);
+            if !again {
+                apps.record(&handle, &layout_c, &k, "command", note).await;
+                if crashed {
+                    apps.report_crash(&handle, &k, code, false, false).await;
+                }
+                return;
+            }
+            if !allowed {
+                apps.record(&handle, &layout_c, &k, "error", format!("{note}; it exited {RESTARTS_IN_WINDOW} times in a few minutes, so it isn't restarted again. Check its output, then start it yourself.")).await;
+                apps.report_crash(&handle, &k, code, false, true).await;
+                return;
+            }
+            apps.record(&handle, &layout_c, &k, "command", format!("{note}; restarting it")).await;
+            if crashed {
+                apps.report_crash(&handle, &k, code, true, false).await;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            // Stopped (or started by hand) during the pause: leave it be.
+            if apps.entries.lock().await.get(&k).is_some_and(|e| e.run != run || e.stopping) {
+                return;
+            }
+            let _ = RESTARTS.0.send((project_c, process_c));
+        });
+
+        // Ready once its port answers.
+        if let Some(port) = config.port {
+            let (apps, handle, k) = (self.clone(), app.clone(), key.clone());
+            tauri::async_runtime::spawn(async move {
+                let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
+                while tokio::time::Instant::now() < deadline {
+                    let current = apps.entries.lock().await.get(&k).map(|e| (e.run, e.status.state));
+                    if current != Some((run, "starting")) {
+                        return;
+                    }
+                    if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+                        apps.update(&handle, &k, |e| {
+                            if e.run == run && e.status.state == "starting" {
+                                e.status.state = "running";
+                            }
+                        })
+                        .await;
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            });
+        }
+        Ok(self.status(&key).await)
+    }
+
+    /// Starts the processes that run with the project's app; the first error is returned
+    /// after trying them all.
+    pub async fn start_with_app(&self, app: &AppHandle, settings: &Settings, layout: &Layout, project: &str) -> Result<()> {
+        let names: Vec<String> = settings.sites.get(project).map(|s| s.processes.iter().filter(|p| p.with_app).map(|p| p.name.clone()).collect()).unwrap_or_default();
+        let mut first = None;
+        for name in names {
+            if let Err(e) = self.start_process(app, settings, layout, project, &name).await {
+                self.record(app, layout, &process_key(project, &name), "error", e.to_string()).await;
+                first.get_or_insert(e);
+            }
+        }
+        first.map_or(Ok(()), Err)
+    }
+
+    /// Stops every process of a project (`with_app` only, or all of them).
+    pub async fn stop_processes(&self, app: &AppHandle, settings: &Settings, project: &str, with_app_only: bool) {
+        let prefix = process_key(project, "");
+        let running: Vec<String> = self.entries.lock().await.keys().filter(|k| k.starts_with(&prefix)).cloned().collect();
+        let own = settings.sites.get(project);
+        for key in running {
+            let name = &key[prefix.len()..];
+            let with_app = own.and_then(|s| s.processes.iter().find(|p| p.name == name)).is_none_or(|p| p.with_app);
+            if !with_app_only || with_app {
+                self.stop(app, &key).await;
+            }
+        }
     }
 
     /// Asks the app to stop, then ends its whole process tree.
@@ -563,6 +845,7 @@ impl Apps {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .env("PATH", &path)
+            .envs(crate::shims::tool_env(settings, layout))
             .env("FORCE_COLOR", "0")
             .env("NO_COLOR", "1")
             .env("npm_config_yes", "true")
@@ -585,9 +868,11 @@ impl Apps {
         if let Some(err) = child.stderr.take() {
             self.pipe(app, layout, name, "error", err);
         }
-        let (apps, handle, n, layout, label) = (self.clone(), app.clone(), name.to_string(), layout.clone(), label.to_string());
+        let (apps, handle, n, layout, label, command) = (self.clone(), app.clone(), name.to_string(), layout.clone(), label.to_string(), command.to_string());
+        let started = diagnose::now_ms();
         tauri::async_runtime::spawn(async move {
             let code = child.wait().await.ok().and_then(|s| s.code());
+            remember(&layout, &n, CommandRun { label: label.clone(), command, started, duration_ms: diagnose::now_ms().saturating_sub(started), exit_code: code });
             // Let the last output lines land before the summary.
             tokio::time::sleep(Duration::from_millis(150)).await;
             let summary = match code {

@@ -1,0 +1,39 @@
+schema: 1
+id: java-webapp
+name: Java web app (Tomcat)
+description: A plain servlet web app (WEB-INF and a JSP page) served by Tomcat, no build needed.
+icon: coffee
+color: amber
+duration: seconds
+requires:
+  java: "17"
+steps:
+  - name: Creating WEB-INF/web.xml
+    write:
+      path: WEB-INF/web.xml
+      content: |
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!-- Servlet 4.0 descriptor: Tomcat 9, 10 and 11 all read it. -->
+        <web-app xmlns="http://xmlns.jcp.org/xml/ns/javaee" version="4.0">
+          <display-name>{{project}}</display-name>
+          <welcome-file-list>
+            <welcome-file>index.jsp</welcome-file>
+          </welcome-file-list>
+        </web-app>
+  - name: Creating index.jsp
+    write:
+      path: index.jsp
+      content: |
+        <%@ page contentType="text/html;charset=UTF-8" %>
+        <!doctype html>
+        <title>{{project}}</title>
+        <h1>Hello from {{project}}</h1>
+        <p>Served by <%= application.getServerInfo() %> on Java <%= System.getProperty("java.version") %>.</p>
+  - id: git
+    optional: true
+    default: false
+    label: Initialise a Git repository
+    needs: [git]
+    git_init:
+      commit: New Java web app
+done: Install and start Tomcat (Services → Web and app servers); {{url}} is served by it. Pages and classes reload when they change.

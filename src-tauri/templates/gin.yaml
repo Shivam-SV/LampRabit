@@ -1,0 +1,60 @@
+schema: 1
+id: gin
+name: Gin
+description: A Go API with the Gin framework, run with go run.
+icon: zap
+color: sky
+duration: go get · seconds
+requires:
+  go: "1.22"
+steps:
+  - name: Creating go.mod
+    run: go mod init {{project}}
+  - name: Creating main.go
+    write:
+      path: main.go
+      content: |
+        package main
+
+        import (
+        	"net/http"
+        	"os"
+
+        	"github.com/gin-gonic/gin"
+        )
+
+        func main() {
+        	r := gin.Default()
+        	// Requests come through LampRabit's web server on this machine.
+        	r.SetTrustedProxies([]string{"127.0.0.1"})
+
+        	r.GET("/", func(c *gin.Context) {
+        		c.JSON(http.StatusOK, gin.H{"message": "Hello from {{project}}"})
+        	})
+
+        	// LampRabit passes the port it serves {{domain}} from.
+        	port := os.Getenv("PORT")
+        	if port == "" {
+        		port = "8080"
+        	}
+        	r.Run("127.0.0.1:" + port)
+        }
+  - name: Adding Gin
+    run: go get github.com/gin-gonic/gin && go mod tidy
+  - id: git
+    optional: true
+    default: false
+    label: Initialise a Git repository
+    needs: [git]
+    git_init:
+      commit: New Gin project
+serve:
+  mode: dynamic
+  command: go run .
+commands:
+  list:
+    - name: Run the tests
+      run: go test ./...
+    - name: Tidy dependencies
+      run: go mod tidy
+done: Start it from the Sites page; it's served at {{url}}.

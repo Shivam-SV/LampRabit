@@ -1,0 +1,49 @@
+schema: 1
+id: spring-boot
+name: Spring Boot
+description: A Spring Boot web app from Spring Initializr (Maven, with DevTools), run with its Maven wrapper.
+icon: coffee
+color: green
+duration: Maven · a few minutes the first time
+requires:
+  java: "17"
+variables:
+  - id: package
+    label: Java package
+    default: com.example.app
+    required: true
+steps:
+  # Spring Initializr builds the project; the zip holds it in a folder named after it.
+  - name: Generating the project with Spring Initializr
+    download:
+      url: "https://start.spring.io/starter.zip?type=maven-project&language=java&groupId=com.example&artifactId={{project}}&name={{project}}&packageName={{vars.package}}&javaVersion={{java_major}}&dependencies=web,devtools&baseDir={{project}}"
+      extract: true
+      strip: "{{project}}"
+  - name: Using the port LampRabit picks
+    write:
+      path: src/main/resources/application.properties
+      content: |
+        spring.application.name={{project}}
+        # LampRabit passes the port it serves {{domain}} from as PORT.
+        server.port=${PORT:8080}
+        server.address=127.0.0.1
+        server.forward-headers-strategy=framework
+  - name: Downloading Maven and the dependencies (first build)
+    run: "{{mvnw}} -q -DskipTests package"
+  - id: git
+    optional: true
+    default: false
+    label: Initialise a Git repository
+    needs: [git]
+    git_init:
+      commit: New Spring Boot project
+serve:
+  mode: dynamic
+  command: "{{mvnw}} spring-boot:run"
+commands:
+  list:
+    - name: Run the tests
+      run: "{{mvnw}} test"
+    - name: Build the jar
+      run: "{{mvnw}} -DskipTests package"
+done: Start it from the Sites page (the first start compiles it); it's served at {{url}}.

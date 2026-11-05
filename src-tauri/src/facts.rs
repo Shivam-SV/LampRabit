@@ -39,6 +39,8 @@ pub struct Dependencies {
     pub dev_count: usize,
     /// vendor/ or node_modules/ exists.
     pub installed: bool,
+    /// Installed, but the lock file (or manifest) changed since: a pull or a branch switch.
+    pub outdated: bool,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -53,7 +55,7 @@ pub struct Git {
 }
 
 /// .env settings shown on the Overview. Secrets (APP_KEY, passwords, tokens) are left out on purpose.
-const ENV_KEYS: [&str; 10] = ["APP_ENV", "APP_DEBUG", "APP_URL", "DB_CONNECTION", "DB_HOST", "DB_PORT", "MAIL_HOST", "CACHE_STORE", "QUEUE_CONNECTION", "NODE_ENV"];
+pub const ENV_KEYS: [&str; 10] = ["APP_ENV", "APP_DEBUG", "APP_URL", "DB_CONNECTION", "DB_HOST", "DB_PORT", "MAIL_HOST", "CACHE_STORE", "QUEUE_CONNECTION", "NODE_ENV"];
 
 /// The package that carries each framework's version.
 const PHP_PACKAGES: [(&str, &[&str]); 10] = [
@@ -79,6 +81,17 @@ const NODE_PACKAGES: [(&str, &str); 8] = [
     ("Express", "express"),
 ];
 
+/// Whether the first of `sources` that exists changed after the first of `marks` that
+/// exists (a lock file newer than the install it describes). A few seconds of slack keep a
+/// fresh install, which writes both, from counting.
+fn newer(dir: &Path, sources: &[&str], marks: &[&str]) -> bool {
+    let time = |names: &[&str]| names.iter().find_map(|n| std::fs::metadata(dir.join(n)).and_then(|m| m.modified()).ok());
+    match (time(sources), time(marks)) {
+        (Some(source), Some(mark)) => source.duration_since(mark).is_ok_and(|d| d > Duration::from_secs(5)),
+        _ => false,
+    }
+}
+
 fn json(path: &Path) -> Option<Value> {
     serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
 }
@@ -102,12 +115,18 @@ pub async fn read(dir: &Path, framework: Option<&str>, package_manager: &str) ->
     if let Some(c) = &composer {
         facts.php_requirement = text(&c["require"]["php"]);
         let count = |key: &str| c[key].as_object().map_or(0, |m| m.keys().filter(|k| *k != "php" && !k.starts_with("ext-")).count());
-        facts.dependencies.push(Dependencies { manager: "Composer".into(), count: count("require"), dev_count: count("require-dev"), installed: dir.join("vendor/autoload.php").is_file() });
+        let installed = dir.join("vendor/autoload.php").is_file();
+        let outdated = installed && newer(dir, &["composer.lock", "composer.json"], &["vendor/composer/installed.json"]);
+        facts.dependencies.push(Dependencies { manager: "Composer".into(), count: count("require"), dev_count: count("require-dev"), installed, outdated });
     }
     if let Some(p) = &package {
         facts.node_requirement = text(&p["engines"]["node"]);
         let count = |key: &str| p[key].as_object().map_or(0, |m| m.len());
-        facts.dependencies.push(Dependencies { manager: package_manager.into(), count: count("dependencies"), dev_count: count("devDependencies"), installed: dir.join("node_modules").is_dir() });
+        let installed = dir.join("node_modules").is_dir();
+        // Each package manager leaves its own note of what it installed.
+        let marks = ["node_modules/.package-lock.json", "node_modules/.modules.yaml", "node_modules/.yarn-state.yml", "node_modules/.yarn-integrity", "node_modules"];
+        let outdated = installed && newer(dir, &["package-lock.json", "pnpm-lock.yaml", "yarn.lock", "bun.lock", "bun.lockb", "package.json"], &marks);
+        facts.dependencies.push(Dependencies { manager: package_manager.into(), count: count("dependencies"), dev_count: count("devDependencies"), installed, outdated });
     }
 
     facts.framework_version = framework.and_then(|f| framework_version(dir, f, composer.as_ref(), package.as_ref()));

@@ -68,7 +68,7 @@ export default function Titlebar() {
         </Button>
         {/* Home has its own (profile-aware) Start, Restart and Stop in its header. */}
         {page === "overview" ? null : anyRunning ? (
-          <Button size="sm" onClick={stack.stopAll} disabled={stack.busy} title="Stop all (Shift+X)">
+          <Button size="sm" onClick={stack.stopAll} disabled={stack.busy || stack.stoppable.length === 0} title="Stop all (Shift+X)">
             <Square size={12} className="fill-current" /> Stop all
           </Button>
         ) : nothingInstalled ? (

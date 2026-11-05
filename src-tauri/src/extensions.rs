@@ -14,7 +14,7 @@ use crate::{
 
 /// Enabled by default when the PHP build ships them.
 pub const DEFAULTS: &[&str] = &[
-    "bz2", "curl", "exif", "fileinfo", "gd", "gettext", "intl", "mbstring", "mysqli", "openssl", "pdo_mysql", "pdo_sqlite",
+    "bz2", "curl", "exif", "fileinfo", "gd", "gettext", "intl", "mbstring", "mysqli", "openssl", "pdo_mysql", "pdo_pgsql", "pdo_sqlite", "pgsql",
     "sodium", "sqlite3", "xsl", "zip", "opcache",
 ];
 
@@ -45,7 +45,7 @@ const EXTRAS: &[Extra] = &[
         ini: "",
         note: Some("Pairs with LampRabit's Memcached service. Installs libmemcached's DLL next to PHP."),
     },
-    Extra { name: "mongodb", description: "MongoDB driver", ini: "", note: None },
+    Extra { name: "mongodb", description: "MongoDB driver", ini: "", note: Some("Pairs with LampRabit's MongoDB service.") },
     Extra { name: "pcov", description: "Fast code coverage for PHPUnit", ini: "pcov.enabled = 1\n", note: Some("Don't enable together with Xdebug coverage.") },
     Extra { name: "imagick", description: "ImageMagick image processing", ini: "", note: Some("Installs ImageMagick's DLLs next to PHP.") },
     Extra { name: "yaml", description: "YAML parsing and emitting", ini: "", note: None },

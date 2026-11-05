@@ -11,13 +11,15 @@ import pathlib
 import re
 import sys
 
-NAME = re.compile(r"^(apache|nginx|php|redis|memcached)-(.+)-(linux|macos|windows)-(x86_64|aarch64)\.tar\.gz$")
+NAME = re.compile(r"^(apache|nginx|php|redis|memcached|minio)-(.+)-(linux|macos|windows)-(x86_64|aarch64)\.tar\.gz$")
 
 
 def label(runtime, version):
     # nginx.org: odd minor versions are mainline, even ones stable.
     if runtime == "nginx":
         return "Mainline" if int(version.split(".")[1]) % 2 else "Stable"
+    if runtime == "minio":
+        return "Unmaintained upstream"
     return None
 
 

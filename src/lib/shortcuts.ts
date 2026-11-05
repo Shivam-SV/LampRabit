@@ -1,3 +1,4 @@
+import { usePageActive } from "./pageActive";
 import { useEffect, useRef } from "react";
 
 /** Every shortcut, as shown in the "?" dialog. Handlers live with the screens they act on. */
@@ -37,6 +38,13 @@ export const SHORTCUTS: { group: string; items: { keys: string[]; label: string 
       { keys: ["L"], label: "Its logs" },
     ],
   },
+  {
+    group: "Sites: a project",
+    items: [
+      { keys: ["["], label: "Previous tab (Overview, Commands, Domains, Settings)" },
+      { keys: ["]"], label: "Next tab" },
+    ],
+  },
 
 ];
 
@@ -63,8 +71,11 @@ function typing(target: EventTarget | null) {
 export function useHotkeys(handlers: Record<string, (e: KeyboardEvent) => void>, enabled = true) {
   const ref = useRef(handlers);
   ref.current = handlers;
+  // A page kept mounted in the background doesn't take keys.
+  const pageActive = usePageActive();
+  const on = enabled && pageActive;
   useEffect(() => {
-    if (!enabled) return;
+    if (!on) return;
     const onKey = (e: KeyboardEvent) => {
       // A page's own handler (registered before the app-wide one) has taken the key.
       // Holding an arrow key keeps moving; holding anything else doesn't repeat the action.
@@ -83,5 +94,5 @@ export function useHotkeys(handlers: Record<string, (e: KeyboardEvent) => void>,
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [enabled]);
+  }, [on]);
 }

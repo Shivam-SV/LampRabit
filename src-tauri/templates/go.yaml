@@ -1,0 +1,56 @@
+schema: 1
+id: go
+name: Go web server
+description: A small net/http server in main.go, with no dependencies, run with go run.
+icon: box
+color: sky
+duration: seconds
+requires:
+  go: "1.22"
+steps:
+  - name: Creating go.mod
+    run: go mod init {{project}}
+  - name: Creating main.go
+    write:
+      path: main.go
+      content: |
+        package main
+
+        import (
+        	"encoding/json"
+        	"log"
+        	"net/http"
+        	"os"
+        )
+
+        func main() {
+        	http.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
+        		w.Header().Set("Content-Type", "application/json")
+        		json.NewEncoder(w).Encode(map[string]string{"message": "Hello from {{project}}"})
+        	})
+
+        	// LampRabit passes the port it serves {{domain}} from.
+        	port := os.Getenv("PORT")
+        	if port == "" {
+        		port = "8080"
+        	}
+        	log.Printf("Listening on http://127.0.0.1:%s", port)
+        	log.Fatal(http.ListenAndServe("127.0.0.1:"+port, nil))
+        }
+  - id: git
+    optional: true
+    default: false
+    label: Initialise a Git repository
+    needs: [git]
+    git_init:
+      commit: New Go project
+serve:
+  mode: dynamic
+  command: go run .
+commands:
+  list:
+    - name: Run the tests
+      run: go test ./...
+    - name: Build
+      run: go build -o bin/ .
+done: Start it from the Sites page; it's served at {{url}}.

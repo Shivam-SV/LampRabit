@@ -7,8 +7,9 @@ color: red
 duration: Composer · about a minute
 requires:
   php: "8.2"
-  extensions: [ctype, fileinfo, mbstring, openssl, pdo_mysql, tokenizer, xml]
+  extensions: [ctype, fileinfo, mbstring, openssl, tokenizer, xml]
 database: optional
+engines: [mariadb, mysql, postgres, sqlite]
 steps:
   # First, so a database name that's taken stops everything before the long download.
   - create_database: {}
@@ -59,3 +60,9 @@ commands:
     - name: Rebuild the database with seed data
       run: php artisan migrate:fresh --seed --force
       description: Drops every table, migrates again and runs the seeders.
+processes:
+  # Laravel's queue runs jobs in the background; start it from Commands → Keep running.
+  - name: queue
+    command: php artisan queue:work --tries=3
+    restart: always
+    autostart: false

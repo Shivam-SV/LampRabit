@@ -34,6 +34,14 @@ const BUILT_IN: &[(&str, &str)] = &[
     ("astro.yaml", include_str!("../templates/astro.yaml")),
     ("express.yaml", include_str!("../templates/express.yaml")),
     ("nestjs.yaml", include_str!("../templates/nestjs.yaml")),
+    ("django.yaml", include_str!("../templates/django.yaml")),
+    ("flask.yaml", include_str!("../templates/flask.yaml")),
+    ("fastapi.yaml", include_str!("../templates/fastapi.yaml")),
+    ("spring-boot.yaml", include_str!("../templates/spring-boot.yaml")),
+    ("java-webapp.yaml", include_str!("../templates/java-webapp.yaml")),
+    ("go.yaml", include_str!("../templates/go.yaml")),
+    ("gin.yaml", include_str!("../templates/gin.yaml")),
+    ("axum.yaml", include_str!("../templates/axum.yaml")),
     ("static.yaml", include_str!("../templates/static.yaml")),
 ];
 
@@ -59,6 +67,10 @@ pub struct Template {
     pub requires: Requires,
     #[serde(default)]
     pub database: DatabaseUse,
+    /// The database servers the template can set the project up for; MariaDB and MySQL
+    /// when absent (most PHP apps' configs are written for them).
+    #[serde(default = "mysql_family")]
+    pub engines: Vec<DbEngine>,
     #[serde(default)]
     pub variables: Vec<Variable>,
     pub steps: Vec<Step>,
@@ -72,6 +84,74 @@ pub struct Template {
     /// What the project's Commands panel offers.
     #[serde(default)]
     pub commands: Option<CommandsTemplate>,
+    /// Processes the project gets (Sites → Commands → Keep running): a queue worker, Vite.
+    #[serde(default)]
+    pub processes: Vec<TemplateProcess>,
+    /// Subdomains the project gets (Sites → Domains): admin.<project>.test to a folder,
+    /// a port or one of the processes above.
+    #[serde(default)]
+    pub domains: Vec<TemplateDomain>,
+}
+
+/// A process a template's projects get.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TemplateProcess {
+    /// Lowercase letters, digits and dashes: "queue", "vite".
+    pub name: String,
+    /// Placeholders work; `{port}` is the process's port.
+    pub command: String,
+    /// A folder of the project to run in; the project folder when absent.
+    #[serde(default)]
+    pub cwd: String,
+    /// A port number, or "auto" for a free one picked when the project is created.
+    #[serde(default)]
+    pub port: Option<String>,
+    #[serde(default)]
+    pub restart: crate::config::RestartPolicy,
+    /// Starts when the project starts; false leaves it to be started by hand.
+    #[serde(default = "yes")]
+    pub autostart: bool,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// Added only when this holds (like a step's `if:`).
+    #[serde(default, rename = "if", alias = "when")]
+    pub when: Option<String>,
+}
+
+/// A subdomain a template's projects get; at most one of `root`, `port` and `process`
+/// (none: wherever the main domain goes).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TemplateDomain {
+    /// The first label: "admin" makes admin.<project>.test.
+    pub name: String,
+    /// A folder of the project ("admin/public"); "" for the main domain's folder.
+    #[serde(default)]
+    pub root: Option<String>,
+    #[serde(default)]
+    pub port: Option<u16>,
+    /// One of the template's processes, which needs a port.
+    #[serde(default)]
+    pub process: Option<String>,
+    #[serde(default, rename = "if", alias = "when")]
+    pub when: Option<String>,
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl TemplateDomain {
+    pub fn target(&self) -> crate::config::DomainTarget {
+        use crate::config::DomainTarget;
+        match (&self.root, self.port, &self.process) {
+            (Some(root), _, _) => DomainTarget::Files { root: root.clone() },
+            (_, Some(port), _) => DomainTarget::Port { port },
+            (_, _, Some(name)) => DomainTarget::Process { name: name.clone() },
+            _ => DomainTarget::Main,
+        }
+    }
 }
 
 /// A template's commands: where to discover them, and fixed ones of its own.
@@ -110,6 +190,18 @@ pub struct Requires {
     /// A Node.js project: the wizard asks for the Node version and package manager.
     #[serde(default)]
     pub node: bool,
+    /// Lowest Python version ("3.10"): LampRabit's Python must be installed.
+    #[serde(default)]
+    pub python: Option<String>,
+    /// Lowest Java version ("17"): LampRabit's Java must be installed.
+    #[serde(default)]
+    pub java: Option<String>,
+    /// Lowest Go version ("1.22"): LampRabit's Go must be installed.
+    #[serde(default)]
+    pub go: Option<String>,
+    /// Lowest Rust version ("1.80"): LampRabit's Rust must be installed.
+    #[serde(default)]
+    pub rust: Option<String>,
 }
 
 /// How a Node project runs once created; saved as its app setup (Sites → Node app).
@@ -140,6 +232,45 @@ pub enum DatabaseUse {
     Optional,
     /// The project can't work without one.
     Required,
+}
+
+/// A database server a project can be created on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DbEngine {
+    Mariadb,
+    Mysql,
+    Postgres,
+    /// A file in the project; nothing to install or start.
+    Sqlite,
+    /// Only for backups; no template sets a project up on it yet.
+    Mongodb,
+}
+
+impl DbEngine {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Mariadb => "mariadb",
+            Self::Mysql => "mysql",
+            Self::Postgres => "postgres",
+            Self::Sqlite => "sqlite",
+            Self::Mongodb => "mongodb",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Mariadb => "MariaDB",
+            Self::Mysql => "MySQL",
+            Self::Postgres => "PostgreSQL",
+            Self::Sqlite => "SQLite",
+            Self::Mongodb => "MongoDB",
+        }
+    }
+}
+
+fn mysql_family() -> Vec<DbEngine> {
+    vec![DbEngine::Mariadb, DbEngine::Mysql]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -447,6 +578,12 @@ pub const PLACEHOLDERS: &[&str] = &[
     "db.user",
     "db.password",
     "db.server_version",
+    "venv.python",
+    "mvnw",
+    "java_major",
+    "db.scheme",
+    "db.charset",
+    "db.pdo",
     "mail.host",
     "mail.port",
     "node_version",
@@ -489,8 +626,13 @@ impl Template {
         }
         if let Some(serve) = &self.serve {
             if serve.mode == crate::config::ServeMode::Dynamic {
-                if !self.requires.node {
-                    return Err(Error::msg("serve: dynamic needs requires: node: true"));
+                // A dev server runs on a language LampRabit provides.
+                let language = self.requires.node || [&self.requires.python, &self.requires.java, &self.requires.go, &self.requires.rust].iter().any(|r| r.is_some());
+                if !language {
+                    return Err(Error::msg("serve: dynamic needs a language: requires: node, python, java, go or rust"));
+                }
+                if !serve.file.trim().is_empty() && !self.requires.node {
+                    return Err(Error::msg("serve: file runs with node, so it needs requires: node: true"));
                 }
                 if serve.command.trim().is_empty() && serve.file.trim().is_empty() {
                     return Err(Error::msg("serve: dynamic needs a command or a file"));
@@ -500,6 +642,47 @@ impl Template {
                 if !PLACEHOLDERS.contains(&name.as_str()) && !name.starts_with("vars.") {
                     return Err(Error::msg(format!("serve: unknown placeholder {{{{{name}}}}}")));
                 }
+            }
+        }
+        let known = |name: &str| PLACEHOLDERS.contains(&name) || name.strip_prefix("vars.").is_some_and(|v| self.variables.iter().any(|x| x.id == v));
+        let label_ok = |s: &str| !s.is_empty() && !s.starts_with('-') && !s.ends_with('-') && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+        let mut names = std::collections::BTreeSet::new();
+        for p in &self.processes {
+            if !label_ok(&p.name) || !names.insert(p.name.as_str()) {
+                return Err(Error::msg(format!("process \"{}\": names are lowercase letters, digits and dashes, each used once", p.name)));
+            }
+            if p.command.trim().is_empty() {
+                return Err(Error::msg(format!("process {}: command is empty", p.name)));
+            }
+            match p.port.as_deref() {
+                None | Some("auto") => {}
+                Some(n) if n.parse::<u16>().is_ok_and(|n| n >= 1024) => {}
+                Some(n) => return Err(Error::msg(format!("process {}: port \"{n}\" isn't \"auto\" or a number from 1024 up", p.name))),
+            }
+            for text in [&p.command, &p.cwd].into_iter().chain(p.env.values()) {
+                if let Some(name) = placeholders(text).into_iter().find(|n| !known(n)) {
+                    return Err(Error::msg(format!("process {}: unknown placeholder {{{{{name}}}}}", p.name)));
+                }
+            }
+            if let Some(when) = &p.when {
+                parse_condition(when).map_err(|e| Error::msg(format!("process {}: {e}", p.name)))?;
+            }
+        }
+        let mut subs = std::collections::BTreeSet::new();
+        for d in &self.domains {
+            if !d.name.split('.').all(label_ok) || !subs.insert(d.name.as_str()) {
+                return Err(Error::msg(format!("domain \"{}\": use lowercase letters, digits and dashes (like admin), each once", d.name)));
+            }
+            if [d.root.is_some(), d.port.is_some(), d.process.is_some()].iter().filter(|x| **x).count() > 1 {
+                return Err(Error::msg(format!("domain {}: give one of root, port or process", d.name)));
+            }
+            if let Some(name) = &d.process {
+                if !self.processes.iter().any(|p| &p.name == name && p.port.is_some()) {
+                    return Err(Error::msg(format!("domain {}: process {name} isn't in processes:, or has no port", d.name)));
+                }
+            }
+            if let Some(when) = &d.when {
+                parse_condition(when).map_err(|e| Error::msg(format!("domain {}: {e}", d.name)))?;
             }
         }
         let mut ids = std::collections::BTreeSet::new();
@@ -732,9 +915,15 @@ pub struct TemplateInfo {
     pub path: Option<PathBuf>,
     pub uses_php: bool,
     pub uses_node: bool,
+    /// Lowest Python, Java, Go and Rust versions the template needs (LampRabit's own).
+    pub python: Option<String>,
+    pub java: Option<String>,
+    pub go: Option<String>,
+    pub rust: Option<String>,
     pub min_php: Option<String>,
     pub extensions: Vec<String>,
     pub database: DatabaseUse,
+    pub engines: Vec<DbEngine>,
     pub variables: Vec<Variable>,
     pub optional_steps: Vec<OptionalStep>,
     /// Steps that need approval before running (user templates only).
@@ -769,6 +958,11 @@ pub struct Catalog {
 
 pub fn folder(layout: &Layout) -> PathBuf {
     layout.root().join("templates")
+}
+
+/// Reads and checks a template's YAML, as loading one does (for the template editor).
+pub fn parse_text(text: &str) -> Result<Template> {
+    parse(text)
 }
 
 fn parse(text: &str) -> Result<Template> {
@@ -833,9 +1027,14 @@ pub fn catalog(layout: &Layout) -> Catalog {
             path,
             uses_php: t.uses_php(),
             uses_node: t.uses_node(),
+            python: t.requires.python.clone(),
+            java: t.requires.java.clone(),
+            go: t.requires.go.clone(),
+            rust: t.requires.rust.clone(),
             min_php: t.requires.php.clone().filter(|v| v != "any"),
             extensions: t.requires.extensions.clone(),
             database: t.database,
+            engines: t.engines.clone(),
             variables: t.variables.clone(),
             done: t.done.clone(),
         })
@@ -938,6 +1137,23 @@ steps:
         assert!(parse(base).unwrap_err().to_string().contains("unknown placeholder"));
         assert!(parse("schema: 2\nid: t\nname: T\nsteps:\n  - run: echo\n").unwrap_err().to_string().contains("schema 2"));
         assert!(parse("schema: 1\nid: t\nname: T\nsteps:\n  - teleport: x\n").is_err());
+    }
+
+    #[test]
+    fn processes_and_domains_are_checked() {
+        let base = "schema: 1\nid: t\nname: T\nsteps:\n  - run: echo\n";
+        let ok = format!("{base}processes:\n  - name: api\n    command: npm run dev -- --port {{port}}\n    port: auto\ndomains:\n  - name: api\n    process: api\n  - name: admin\n    root: admin/public\n");
+        let t = parse(&ok).unwrap();
+        assert_eq!(t.domains[1].target(), crate::config::DomainTarget::Files { root: "admin/public".into() });
+        for (bad, why) in [
+            (format!("{base}domains:\n  - name: api\n    process: nope\n"), "unknown process"),
+            (format!("{base}domains:\n  - name: x\n    root: a\n    port: 3000\n"), "two targets"),
+            (format!("{base}processes:\n  - name: web\n    command: x\n    port: '80'\n"), "port below 1024"),
+            (format!("{base}processes:\n  - name: Web\n    command: x\n"), "uppercase name"),
+            (format!("{base}processes:\n  - name: w\n    command: \"{{{{nope}}}}\"\n"), "unknown placeholder"),
+        ] {
+            assert!(parse(&bad).is_err(), "{why} should be refused");
+        }
     }
 
     #[test]

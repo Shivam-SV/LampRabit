@@ -9,6 +9,7 @@ requires:
   php: "8.2"
   extensions: [ctype, mbstring, tokenizer, xml]
 database: optional
+engines: [mariadb, mysql, postgres]
 steps:
   - create_database: {}
   - name: Creating the project with Composer (symfony/skeleton)
@@ -25,7 +26,7 @@ steps:
       file: .env.local
       values:
         # Doctrine tells MariaDB and MySQL apart by serverVersion ("11.8.9-MariaDB" or "8.4.13").
-        DATABASE_URL: '"mysql://{{db.user}}:{{db.password}}@{{db.host}}:{{db.port}}/{{database}}?serverVersion={{db.server_version}}&charset=utf8mb4"'
+        DATABASE_URL: '"{{db.scheme}}://{{db.user}}:{{db.password}}@{{db.host}}:{{db.port}}/{{database}}?serverVersion={{db.server_version}}&charset={{db.charset}}"'
   - id: git
     optional: true
     default: false

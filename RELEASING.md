@@ -50,6 +50,18 @@ npx tauri build
 
 Without the signing key the build still succeeds but warns that updater artifacts can't be signed.
 
+## Smoke test
+
+`.github/workflows/smoke.yml` installs the runtimes with the real app and starts, probes, restarts and stops every service on Windows, Linux and macOS. It runs on pull requests that touch the backend and weekly (with Elasticsearch, OpenSearch, Neo4j, RabbitMQ, pgAdmin, Go and Rust too); run it by hand from the Actions tab, optionally with a list of runtime ids. Locally, with a debug build:
+
+```bash
+cd src-tauri && cargo build
+# Any empty folder; the app's own settings and folder are left alone. Linux: under xvfb-run.
+./target/debug/lamprabit --smoke-test /tmp/lr-smoke redis php apache
+```
+
+It prints one line per step, writes `smoke-report.json` into the folder (its `logs/` has each service's output) and exits with 1 when anything failed.
+
 ## Own runtime builds (Apache, Nginx, PHP, Redis, Memcached)
 
 Nobody publishes portable Linux or macOS builds of Apache, Nginx or PHP, so LampRabit builds its own, for Linux and macOS (x86_64 and aarch64 each). [.github/workflows/binaries.yml](.github/workflows/binaries.yml) runs the scripts in [build/linux/](build/linux/) and publishes the archives plus `manifest.json` (with a sha256 for each) to a pre-release tagged **`binaries`**. On Linux and macOS, the Services page reads that manifest (and on Windows, for Memcached). It's a pre-release on purpose: GitHub never treats it as "latest", so the app updater keeps finding app releases.

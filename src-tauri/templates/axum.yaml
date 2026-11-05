@@ -1,0 +1,55 @@
+schema: 1
+id: axum
+name: Axum
+description: A Rust web server with Axum and Tokio, run with cargo run.
+icon: flame
+color: orange
+duration: Cargo · a few minutes the first time
+requires:
+  rust: "1.80"
+steps:
+  - name: Creating the Cargo project
+    run: cargo init --name {{project}} --vcs none
+  - name: Adding Axum and Tokio
+    run: cargo add axum && cargo add tokio --features full
+  - name: Creating src/main.rs
+    write:
+      path: src/main.rs
+      content: |
+        use axum::{routing::get, Json, Router};
+        use serde_json::{json, Value};
+
+        async fn index() -> Json<Value> {
+            Json(json!({ "message": "Hello from {{project}}" }))
+        }
+
+        #[tokio::main]
+        async fn main() {
+            let app = Router::new().route("/", get(index));
+            // LampRabit passes the port it serves {{domain}} from.
+            let port = std::env::var("PORT").unwrap_or_else(|_| "8080".into());
+            let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await.unwrap();
+            println!("Listening on http://127.0.0.1:{port}");
+            axum::serve(listener, app).await.unwrap();
+        }
+  - name: Adding serde_json
+    run: cargo add serde_json
+  - name: Building it once (later starts are quick)
+    run: cargo build
+  - id: git
+    optional: true
+    default: false
+    label: Initialise a Git repository
+    needs: [git]
+    git_init:
+      commit: New Axum project
+serve:
+  mode: dynamic
+  command: cargo run
+commands:
+  list:
+    - name: Run the tests
+      run: cargo test
+    - name: Build for release
+      run: cargo build --release
+done: Start it from the Sites page; it's served at {{url}}.

@@ -1,24 +1,24 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { open } from "@tauri-apps/plugin-dialog";
-import { openUrl } from "@tauri-apps/plugin-opener";
+import { openPath, openUrl } from "@tauri-apps/plugin-opener";
 import {
   CheckCircle2,
   CircleSlash,
   Database,
   ExternalLink,
   Feather,
+  FolderInput,
   FolderOpen,
   Layers,
   LifeBuoy,
   Mail,
+  ScrollText,
   Monitor,
   Moon,
   Palette,
   Plug,
   Power,
   RefreshCw,
-  Save,
   ServerCog,
   Settings2,
   Share2,
@@ -30,7 +30,7 @@ import {
   Wind,
 } from "lucide-react";
 import clsx from "clsx";
-import { api, runtimeLabels, type EnvPaths, type PortStatus, type Runtime, type Settings as SettingsT } from "../lib/api";
+import { allServers, api, runtimeLabels, type EnvPaths, type PortStatus, type Runtime, type Server, type Settings as SettingsT } from "../lib/api";
 import { useAppStore } from "../lib/store";
 import { useTheme } from "../lib/theme";
 import { useMotion } from "../lib/motion";
@@ -39,22 +39,12 @@ import { getVersion } from "@tauri-apps/api/app";
 import { disable as disableAutostart, enable as enableAutostart, isEnabled as isAutostartEnabled } from "@tauri-apps/plugin-autostart";
 import { runtimeTiles } from "../components/runtimes";
 import UninstallDialog from "../components/UninstallDialog";
+import MoveEnvironmentDialog from "../components/MoveEnvironmentDialog";
+import ApplyBar from "../components/ApplyBar";
+import { portFields, portShown, serverNotes } from "../lib/settingsFields";
 import { Button, Card, PageHeader, Segmented, Switch, inputClass } from "../components/ui";
 
 type Os = EnvPaths["os"];
-
-/** `only` limits a field to the platforms where it does anything; `both` to when both web servers run. */
-const portFields: { key: keyof SettingsT["ports"]; label: string; hint: string; only?: Os[]; both?: boolean }[] = [
-  { key: "http", label: "HTTP", hint: "Main web server" },
-  { key: "https", label: "HTTPS", hint: "Main web server, SSL" },
-  { key: "nginxHttp", label: "Nginx HTTP", hint: "Nginx next to Apache", both: true },
-  { key: "nginxHttps", label: "Nginx HTTPS", hint: "Nginx next to Apache", both: true },
-  { key: "mysql", label: "MariaDB", hint: "Database" },
-  { key: "mysqlServer", label: "MySQL", hint: "Database, next to MariaDB" },
-  { key: "phpFpm", label: "PHP FastCGI", hint: "First of 10 ports per PHP version" },
-  { key: "redis", label: "Redis", hint: "Cache and queues" },
-  { key: "memcached", label: "Memcached", hint: "Memory cache" },
-];
 
 /** Settings → section index; ids are the anchors. */
 const sections = [
@@ -66,6 +56,7 @@ const sections = [
   { id: "versions", label: "Active versions", icon: Layers },
   { id: "ports", label: "Ports", icon: Plug },
   { id: "email", label: "Email", icon: Mail },
+  { id: "logs", label: "Logs", icon: ScrollText },
   { id: "sharing", label: "Sharing", icon: Share2 },
   { id: "appearance", label: "Appearance", icon: Palette },
   { id: "updates", label: "Updates", icon: Sparkles },
@@ -93,8 +84,10 @@ export default function Settings() {
   const installed = useQuery({ queryKey: ["installed"], queryFn: api.installedRuntimes });
   const os = useQuery({ queryKey: ["paths"], queryFn: api.envPaths }).data?.os;
   const ports = useQuery({ queryKey: ["port-status"], queryFn: api.portStatus, refetchInterval: 5000 });
+  const services = useQuery({ queryKey: ["services"], queryFn: api.listServices });
   const openDiagnostics = useAppStore((s) => s.setDiagnosticsOpen);
   const [uninstalling, setUninstalling] = useState(false);
+  const [moving, setMoving] = useState(false);
   const [draft, setDraft] = useState<SettingsT | null>(null);
   const [versions, setVersions] = useState<Versions | null>(null);
   const [current, setCurrent] = useState<string>("general");
@@ -130,17 +123,18 @@ export default function Settings() {
   const dirty =
     !!draft &&
     !!settings.data &&
-    (JSON.stringify({ ...draft, versions: null, sites: null, profiles: null }) !==
-      JSON.stringify({ ...settings.data, versions: null, sites: null, profiles: null }) ||
+    (JSON.stringify({ ...draft, versions: null, sites: null, profiles: null, catchDumps: null }) !==
+      JSON.stringify({ ...settings.data, versions: null, sites: null, profiles: null, catchDumps: null }) ||
       JSON.stringify(versions) !== JSON.stringify(activeVersions));
 
   const save = useMutation({
     mutationFn: async () => {
       if (!draft || !settings.data) return;
       // Versions are switched separately so running services restart onto them; per-site
-      // options and profiles are owned by other screens, so they come from the latest copy.
+      // options, profiles and the dump catcher (it restarts PHP) are owned by their own
+      // controls, so they come from the latest copy.
       const latest = await api.getSettings();
-      await api.saveSettings({ ...draft, versions: latest.versions, sites: latest.sites, profiles: latest.profiles });
+      await api.saveSettings({ ...draft, versions: latest.versions, sites: latest.sites, profiles: latest.profiles, catchDumps: latest.catchDumps });
       for (const runtime of Object.keys(versions ?? {}) as Runtime[]) {
         const version = versions?.[runtime];
         if (version && version !== activeVersions?.[runtime]) await api.setActiveVersion(runtime, version);
@@ -150,19 +144,16 @@ export default function Settings() {
       for (const key of ["settings", "installed", "services", "paths", "sites"]) {
         queryClient.invalidateQueries({ queryKey: [key] });
       }
-      notify("info", "Settings saved. Restart running services to apply port changes.");
+      notify("info", "Settings applied. Running services that use them were restarted.");
     },
     onError: (e) => notify("error", String(e)),
   });
 
-  const browse = async () => {
-    const dir = await open({ directory: true, defaultPath: draft?.rootDir, title: "Choose environment root" });
-    if (typeof dir === "string" && draft) setDraft({ ...draft, rootDir: dir });
-  };
 
   if (!draft || !versions) return null;
   const set = (patch: Partial<SettingsT>) => setDraft({ ...draft, ...patch });
   const setPort = (key: keyof SettingsT["ports"], value: number) => setDraft({ ...draft, ports: { ...draft.ports, [key]: value } });
+  const installedServices = (services.data ?? []).filter((s) => s.installed && !s.external);
   const dbInstalled = { mariadb: !!activeVersions?.mariadb, mysql: !!activeVersions?.mysql };
 
   return (
@@ -181,9 +172,6 @@ export default function Settings() {
                 <CheckCircle2 size={17} className="text-accent-text" /> All changes saved
               </span>
             )}
-            <Button variant="primary" onClick={() => save.mutate()} disabled={!dirty || save.isPending}>
-              <Save size={16} /> Save changes
-            </Button>
           </div>
         }
       />
@@ -210,11 +198,16 @@ export default function Settings() {
 
         <div className="motion-stagger min-w-0 space-y-6">
           <Section id="general" title="General" subtitle="Where your environment lives and how sites are named.">
-            <Row label="Environment root" hint="Holds runtimes, configs, www, databases and logs." wide>
-              <div className="flex gap-2">
-                <input className={inputClass} value={draft.rootDir} onChange={(e) => set({ rootDir: e.target.value })} aria-label="Environment root" />
-                <Button className="h-auto" onClick={browse}>
-                  <FolderOpen size={15} /> Browse…
+            <Row label="LampRabit folder" hint="Runtimes, configs, your projects (www), databases and logs. Moving it takes everything along." wide>
+              <div className="flex items-center gap-2">
+                <span className="min-w-0 flex-1 truncate rounded-lg bg-surface-2 px-3 py-2 font-mono text-sm" title={draft.rootDir}>
+                  {settings.data?.rootDir ?? draft.rootDir}
+                </span>
+                <Button className="h-auto" onClick={() => settings.data && openPath(settings.data.rootDir).catch(() => {})}>
+                  <FolderOpen size={15} /> Open
+                </Button>
+                <Button className="h-auto" onClick={() => setMoving(true)}>
+                  <FolderInput size={15} /> Move…
                 </Button>
               </div>
             </Row>
@@ -272,6 +265,27 @@ export default function Settings() {
               checked={draft.closeToTray}
               onChange={(v) => set({ closeToTray: v })}
             />
+            <Row
+              label="Restart after a crash"
+              hint="Starts a service again when it stops unexpectedly. After three crashes within five minutes it stays stopped, so the cause shows in Logs."
+              wide
+            >
+              <div className="flex flex-wrap gap-x-6 gap-y-2">
+                {installedServices.length === 0 && <span className="text-sm text-muted">Install a service to choose here.</span>}
+                {installedServices.map((s) => (
+                  <label key={s.kind} className="flex items-center gap-2 text-sm">
+                    <Switch
+                      checked={draft.autoRestart.includes(s.kind)}
+                      onChange={(on) =>
+                        set({ autoRestart: on ? [...draft.autoRestart, s.kind].sort() : draft.autoRestart.filter((k) => k !== s.kind) })
+                      }
+                      label={`Restart ${s.label} after a crash`}
+                    />
+                    {s.label}
+                  </label>
+                ))}
+              </div>
+            </Row>
           </Section>
 
           <Section id="terminal" title="Terminal" subtitle="LampRabit's commands always run your active versions with its config.">
@@ -296,27 +310,33 @@ export default function Settings() {
             </Row>
           </Section>
 
-          <Section id="web" title="Web server" subtitle="Which server runs your sites.">
-            <Row
-              label="Server"
-              hint={
-                draft.webServer === "both"
-                  ? `Apache keeps ports ${draft.ports.http}/${draft.ports.https}; Nginx uses ${draft.ports.nginxHttp}/${draft.ports.nginxHttps}. Pick a server per site on the Sites page.`
-                  : draft.webServer === "nginx"
-                    ? "Nginx serves every site. It ignores .htaccess; unknown URLs go to index.php, which suits Laravel, Symfony and WordPress."
-                    : "Apache serves every site and honours .htaccess files, like XAMPP and Laragon."
-              }
-            >
-              <Segmented
-                value={draft.webServer}
-                onChange={(webServer) => set({ webServer })}
-                options={[
-                  { value: "apache", label: "Apache" },
-                  { value: "nginx", label: "Nginx" },
-                  { value: "both", label: "Both" },
-                ]}
-              />
-            </Row>
+          <Section id="web" title="Web servers" subtitle="Which servers run your sites. Several can run side by side, each site on one of them.">
+            {allServers.map((server) => {
+              const on = draft.webServers.includes(server);
+              const only = on && draft.webServers.length === 1;
+              return (
+                <Row key={server} label={runtimeLabels[server]} hint={only ? `${serverNotes[server]} At least one server stays on.` : serverNotes[server]}>
+                  <Switch
+                    checked={on}
+                    disabled={only}
+                    onChange={(v) => set({ webServers: v ? [...draft.webServers, server] : draft.webServers.filter((s) => s !== server) })}
+                    label={`Run ${runtimeLabels[server]}`}
+                  />
+                </Row>
+              );
+            })}
+            {draft.webServers.length > 1 && (
+              <Row
+                label="Primary server"
+                hint={`It has ports ${draft.ports.http}/${draft.ports.https}, localhost and the developer tools; the others use their own ports (below). Pick each site's server on the Sites page.`}
+              >
+                <Segmented
+                  value={draft.webServers[0]}
+                  onChange={(primary: Server) => set({ webServers: [primary, ...draft.webServers.filter((s) => s !== primary)] })}
+                  options={draft.webServers.map((s) => ({ value: s, label: runtimeLabels[s] }))}
+                />
+              </Row>
+            )}
             {os === "windows" && (
               <Row label="PHP workers per version" hint="Each handles one request at a time. 4 suits most projects; raise it for parallel requests.">
                 <input
@@ -354,8 +374,8 @@ export default function Settings() {
           </Section>
 
           <Section id="versions" title="Active versions" subtitle="Which installed version each service runs. Sites can pick their own PHP.">
-            {(["apache", "nginx", "php", "mariadb", "mysql", "composer"] as Runtime[])
-              .filter((r) => (r === "apache" ? draft.webServer !== "nginx" : r === "nginx" ? draft.webServer !== "apache" : true))
+            {(["apache", "nginx", "caddy", "frankenphp", "php", "mariadb", "mysql", "composer", "java", "tomcat"] as Runtime[])
+              .filter((r) => !(allServers as Runtime[]).includes(r) || draft.webServers.includes(r as Server))
               .map((runtime) => {
                 const options = installed.data?.find((i) => i.runtime === runtime)?.versions ?? [];
                 return (
@@ -394,10 +414,10 @@ export default function Settings() {
               })}
           </Section>
 
-          <Section id="ports" title="Ports" subtitle="Network ports used by local services. Restart a service to apply a change.">
+          <Section id="ports" title="Ports" subtitle="Network ports used by local services. Running services restart when you apply a change.">
             <div className="grid sm:grid-cols-2">
               {portFields
-                .filter((f) => (!f.only || (os && f.only.includes(os))) && (!f.both || draft.webServer === "both"))
+                .filter((f) => portShown(f, draft, os))
                 .map(({ key, label, hint }) => (
                   <div key={key} className="flex items-center gap-4 border-b border-line px-5 py-3 sm:odd:border-r">
                     <div className="min-w-0 flex-1">
@@ -463,6 +483,38 @@ export default function Settings() {
             </Row>
           </Section>
 
+          <Section id="logs" title="Logs" subtitle="How big log files may grow, and what PHP's dump() does.">
+            <ToggleRow
+              label="Catch dump() and dd()"
+              hint="Laravel and Symfony dumps from web requests show in Logs (as a tree you can fold) instead of in the page. Console commands like tinker still print in the terminal. Applies right away; PHP restarts."
+              checked={draft.catchDumps}
+              onChange={(v) =>
+                api.setCatchDumps(v).then(
+                  () => {
+                    setDraft({ ...draft, catchDumps: v });
+                    queryClient.invalidateQueries({ queryKey: ["settings"] });
+                  },
+                  (e) => notify("error", String(e)),
+                )
+              }
+            />
+            <Row label="Rotate a log at" hint="A bigger file is copied aside and started afresh; checked about once a minute.">
+              <span className="flex items-center gap-2 text-sm text-muted">
+                <input type="number" min={1} max={2048} className={numberInput} value={draft.logMaxMb} onChange={(e) => set({ logMaxMb: Math.max(1, Number(e.target.value)) })} aria-label="Rotate a log at (MB)" />
+                MB
+              </span>
+            </Row>
+            <Row label="Old copies to keep" hint="Per log file, as name.1.log, name.2.log…; 0 keeps none.">
+              <input type="number" min={0} max={20} className={numberInput} value={draft.logKeep} onChange={(e) => set({ logKeep: Math.min(20, Math.max(0, Number(e.target.value))) })} aria-label="Old copies to keep" />
+            </Row>
+            <Row label="Logs folder limit" hint="Over this, the oldest copies are deleted first.">
+              <span className="flex items-center gap-2 text-sm text-muted">
+                <input type="number" min={10} max={100000} className={numberInput} value={draft.logTotalMb} onChange={(e) => set({ logTotalMb: Math.max(10, Number(e.target.value)) })} aria-label="Logs folder limit (MB)" />
+                MB
+              </span>
+            </Row>
+          </Section>
+
           <SharingSection />
 
           <Section id="appearance" title="Appearance" subtitle="How LampRabit looks and moves. Applies instantly.">
@@ -525,6 +577,16 @@ export default function Settings() {
           {uninstalling && <UninstallDialog onClose={() => setUninstalling(false)} />}
         </div>
       </div>
+      {moving && settings.data && <MoveEnvironmentDialog current={settings.data.rootDir} onClose={() => setMoving(false)} />}
+      <ApplyBar
+        dirty={dirty}
+        busy={save.isPending}
+        onApply={() => save.mutate()}
+        onDiscard={() => {
+          setDraft(settings.data ?? null);
+          setVersions(activeVersions);
+        }}
+      />
     </>
   );
 }

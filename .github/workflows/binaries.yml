@@ -51,7 +51,7 @@ jobs:
         run: |
           . build/linux/versions.env
           gh release download "$RELEASE_TAG" -p manifest.json -D /tmp 2>/dev/null || echo '{"releases":[]}' > /tmp/manifest.json
-          export NGINX_VERSIONS APACHE_VERSIONS PHP_LINES PHP_LINES_NOT_MACOS REDIS_VERSIONS MEMCACHED_VERSIONS
+          export NGINX_VERSIONS APACHE_VERSIONS PHP_LINES PHP_LINES_NOT_MACOS REDIS_VERSIONS MEMCACHED_VERSIONS MINIO_VERSIONS
           python3 - <<'EOF' >> "$GITHUB_OUTPUT"
           import json, os, urllib.request
           have = {(e["runtime"], e["version"], e.get("os", "linux"), e["arch"]) for e in json.load(open("/tmp/manifest.json"))["releases"]}
@@ -82,6 +82,10 @@ jobs:
           # Memcached for Windows is nono303's build, repackaged (nothing to compile).
           include += [{"kind": "memcached", "version": v, "os": "windows", "arch": "x86_64", "runner": "ubuntu-24.04", "container": "debian:bullseye", "args": "windows"}
                       for v in os.environ["MEMCACHED_VERSIONS"].split() if ("memcached", v, "windows", "x86_64") not in have]
+          # MinIO is pure Go: one Linux runner cross-compiles every platform.
+          minio_targets = [("linux", "x86_64"), ("linux", "aarch64"), ("macos", "x86_64"), ("macos", "aarch64"), ("windows", "x86_64")]
+          include += [{"kind": "minio", "version": v, "os": o, "arch": a, "runner": "ubuntu-24.04", "container": "", "args": f"{o} {a}"}
+                      for v in os.environ["MINIO_VERSIONS"].split() for o, a in minio_targets if ("minio", v, o, a) not in have]
           print(f"matrix={json.dumps({'include': include})}")
           print(f"empty={'true' if not include else 'false'}")
           EOF
@@ -143,7 +147,7 @@ jobs:
           # A pre-release is never "latest", so the app updater keeps finding app releases.
           gh release view "$RELEASE_TAG" >/dev/null 2>&1 || gh release create "$RELEASE_TAG" \
             --title "LampRabit runtimes" --prerelease --latest=false \
-            --notes "Apache, Nginx, PHP, Redis and Memcached for Linux and macOS, and Memcached for Windows (nono303's Cygwin build, https://github.com/nono303/memcached), downloaded by LampRabit's Services page. Built by .github/workflows/binaries.yml from build/linux/; checksums are in manifest.json. Sources: https://github.com/redis/redis, https://github.com/memcached/memcached, Cygwin https://cygwin.com/"
+            --notes "Apache, Nginx, PHP, Redis and Memcached for Linux and macOS, and Memcached for Windows (nono303's Cygwin build, https://github.com/nono303/memcached), and MinIO (built unmodified from its last release, AGPL v3, source: https://github.com/minio/minio), downloaded by LampRabit's Services page. Built by .github/workflows/binaries.yml from build/linux/; checksums are in manifest.json. Sources: https://github.com/redis/redis, https://github.com/memcached/memcached, Cygwin https://cygwin.com/"
           gh release download "$RELEASE_TAG" -p manifest.json -D /tmp 2>/dev/null || true
           python3 build/linux/manifest.py out /tmp/manifest.json > manifest.json
           gh release upload "$RELEASE_TAG" out/*.tar.gz manifest.json --clobber

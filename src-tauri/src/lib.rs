@@ -1,24 +1,34 @@
 mod apps;
+mod backups;
+mod catalog;
 mod comfort;
 mod commands;
 mod config;
 mod configs;
+mod cron;
 mod diagnose;
+mod dumps;
 mod error;
 mod extensions;
 mod facts;
+mod langver;
 mod layout;
 mod logs;
+mod manage;
 mod node;
 mod php;
 mod ports;
 mod procgroup;
+mod projectfile;
 mod projects;
+mod relocate;
 mod runtimes;
 mod services;
 mod shims;
 mod sites;
+mod smoke;
 mod ssl;
+mod templategen;
 mod templates;
 mod tunnels;
 mod uninstall;
@@ -55,6 +65,21 @@ struct AppState {
 }
 
 impl AppState {
+    fn new(settings: Settings, settings_path: PathBuf) -> Self {
+        AppState {
+            settings: RwLock::new(settings),
+            settings_path,
+            supervisor: Supervisor::default(),
+            http: runtimes::client(),
+            installing: Mutex::new(HashSet::new()),
+            ca_trusted: Mutex::new(None),
+            tunnels: tunnels::Tunnels::default(),
+            ops: Mutex::new(()),
+            processes: std::sync::Mutex::new(sysinfo::System::new()),
+            apps: apps::Apps::default(),
+        }
+    }
+
     async fn snapshot(&self) -> (Settings, Layout) {
         let settings = self.settings.read().await.clone();
         let layout = Layout::new(&settings.root_dir);
@@ -70,48 +95,50 @@ impl AppState {
     }
 }
 
-fn active_version(settings: &mut Settings, runtime: Runtime) -> &mut Option<String> {
-    match runtime {
-        Runtime::Apache => &mut settings.versions.apache,
-        Runtime::Php => &mut settings.versions.php,
-        Runtime::Mariadb => &mut settings.versions.mariadb,
-        Runtime::Nginx => &mut settings.versions.nginx,
-        Runtime::Mailpit => &mut settings.versions.mailpit,
-        Runtime::Adminer => &mut settings.versions.adminer,
-        Runtime::Phpmyadmin => &mut settings.versions.phpmyadmin,
-        Runtime::Ngrok => &mut settings.versions.ngrok,
-        Runtime::Cloudflared => &mut settings.versions.cloudflared,
-        Runtime::Redis => &mut settings.versions.redis,
-        Runtime::Composer => &mut settings.versions.composer,
-        Runtime::Mysql => &mut settings.versions.mysql,
-        Runtime::Phpredisadmin => &mut settings.versions.phpredisadmin,
-        Runtime::Memcached => &mut settings.versions.memcached,
-    }
-}
-
 /// Services that load the given runtime and must restart when it changes.
 fn dependents(runtime: Runtime) -> &'static [ServiceKind] {
     match runtime {
         Runtime::Apache => &[ServiceKind::Apache],
         Runtime::Nginx => &[ServiceKind::Nginx],
+        Runtime::Caddy => &[ServiceKind::Caddy],
+        Runtime::Frankenphp => &[ServiceKind::Frankenphp],
+        Runtime::Tomcat => &[ServiceKind::Tomcat],
+        Runtime::Postgres => &[ServiceKind::Postgres],
+        Runtime::Pgadmin => &[ServiceKind::Pgadmin],
+        Runtime::Mongodb => &[ServiceKind::Mongodb],
+        // The shell runs from the terminal; MongoDB uses it only to shut down.
+        Runtime::Mongosh => &[],
+        // Command-line tools and a desktop app: nothing runs them in the background.
+        Runtime::Mongotools | Runtime::Compass | Runtime::Sqlite => &[],
+        Runtime::Clickhouse => &[ServiceKind::Clickhouse],
+        Runtime::Neo4j => &[ServiceKind::Neo4j],
+        Runtime::Meilisearch => &[ServiceKind::Meilisearch],
+        Runtime::Typesense => &[ServiceKind::Typesense],
+        Runtime::Rustfs => &[ServiceKind::Rustfs],
+        Runtime::Ollama => &[ServiceKind::Ollama],
+        Runtime::Minio => &[ServiceKind::Minio],
+        Runtime::Elasticsearch => &[ServiceKind::Elasticsearch],
+        Runtime::Opensearch => &[ServiceKind::Opensearch],
+        Runtime::N8n => &[ServiceKind::N8n],
+        Runtime::Rabbitmq | Runtime::Erlang => &[ServiceKind::Rabbitmq],
+        // Languages run from the terminal and projects' own processes.
+        Runtime::Go | Runtime::Rust | Runtime::Maven | Runtime::Gradle => &[],
+        // Projects run Python themselves; pgAdmin keeps the Python it was installed with.
+        Runtime::Python => &[],
+        Runtime::Phppgadmin => &ServiceKind::WEB,
         // PHP pools are owned by the web servers; restarting them restarts PHP.
-        Runtime::Php => &[ServiceKind::Apache, ServiceKind::Nginx],
+        Runtime::Php => &ServiceKind::WEB,
         Runtime::Mariadb => &[ServiceKind::Mariadb],
         Runtime::Mysql => &[ServiceKind::Mysql],
         Runtime::Mailpit => &[ServiceKind::Mailpit],
-        // Served by Apache through their own virtual hosts.
-        Runtime::Adminer | Runtime::Phpmyadmin | Runtime::Phpredisadmin => &[ServiceKind::Apache],
+        // Served by the primary web server through their own virtual hosts.
+        Runtime::Adminer | Runtime::Phpmyadmin | Runtime::Phpredisadmin => &ServiceKind::WEB,
         // Tunnels start on demand; Composer runs from the terminal.
         Runtime::Ngrok | Runtime::Cloudflared | Runtime::Composer => &[],
+        // Tomcat runs on the active Java.
+        Runtime::Java => &[ServiceKind::Tomcat, ServiceKind::Neo4j],
         Runtime::Redis => &[ServiceKind::Redis],
         Runtime::Memcached => &[ServiceKind::Memcached],
-    }
-}
-
-fn database_service(db: config::Database) -> ServiceKind {
-    match db {
-        config::Database::Mariadb => ServiceKind::Mariadb,
-        config::Database::Mysql => ServiceKind::Mysql,
     }
 }
 
@@ -137,9 +164,8 @@ fn reconcile_versions(settings: &mut Settings) {
     let layout = Layout::new(&settings.root_dir);
     for runtime in Runtime::ALL {
         let installed = runtimes::installed(&layout, runtime);
-        let active = active_version(settings, runtime);
-        if active.as_ref().is_none_or(|v| !installed.contains(v)) {
-            *active = installed.into_iter().next();
+        if settings.versions.get(runtime.id()).is_none_or(|v| !installed.contains(v)) {
+            settings.versions.set(runtime.id(), installed.into_iter().next());
         }
     }
 }
@@ -170,6 +196,7 @@ async fn get_settings(state: State<'_, AppState>) -> Result<Settings> {
 
 #[tauri::command]
 async fn save_settings(app: AppHandle, state: State<'_, AppState>, mut settings: Settings) -> Result<Settings> {
+    let old = state.settings.read().await.clone();
     check_values(&mut settings)?;
     check_ports(&settings)?;
     let layout = Layout::new(&settings.root_dir);
@@ -201,13 +228,52 @@ async fn save_settings(app: AppHandle, state: State<'_, AppState>, mut settings:
     *state.ca_trusted.lock().await = None;
     logs::set_system_file(&app, layout.logs().join("lampRabit.log"));
     logs::system(&app, logs::Level::Info, "Settings saved");
-    for kind in [ServiceKind::Apache, ServiceKind::Nginx] {
+    for kind in ServiceKind::WEB {
         if !kind.enabled(&settings) && state.supervisor.is_running(kind).await {
             logs::system(&app, logs::Level::Info, format!("{} is switched off in Settings; stopping it", kind.label()));
             state.supervisor.stop(&app, kind).await;
         }
     }
+    // Running services pick up what changed for them (ports, the primary server, the
+    // domain suffix…) straight away; services in the old folder were stopped above.
+    if old.root_dir == settings.root_dir {
+        let old_layout = Layout::new(&old.root_dir);
+        let mut restart = Vec::new();
+        for kind in ServiceKind::all() {
+            if kind.enabled(&settings)
+                && state.supervisor.is_running(kind).await
+                && service_fingerprint(kind, &old, &old_layout) != service_fingerprint(kind, &settings, &layout)
+            {
+                state.supervisor.stop(&app, kind).await;
+                restart.push(kind);
+            }
+        }
+        for &kind in &restart {
+            state.supervisor.wait_stopped(kind).await;
+        }
+        for kind in restart {
+            if let Err(e) = state.supervisor.start(&app, kind, &settings, &layout).await {
+                logs::system(&app, logs::Level::Error, format!("{} didn't restart with the new settings: {e}", kind.label()));
+            }
+        }
+    }
     Ok(settings)
+}
+
+/// What a settings change can alter in a running service: its ports and, for web servers,
+/// everything their configs are built from. A different fingerprint means a restart.
+fn service_fingerprint(kind: ServiceKind, settings: &Settings, layout: &Layout) -> String {
+    let ports = services::required_ports(kind, settings, layout);
+    if kind.web_server().is_some() {
+        format!(
+            "{ports:?} {:?} {:?} {} {} {} {}",
+            settings.web_servers, settings.ports, settings.tld, settings.https_by_default, settings.php_workers, settings.route_mail
+        )
+    } else if matches!(kind, ServiceKind::Rustfs | ServiceKind::Minio) {
+        format!("{ports:?} {:?}", settings.storage_dir(layout, kind.id()))
+    } else {
+        format!("{ports:?}")
+    }
 }
 
 /// Domain endings that exist on the internet: using one would send real websites
@@ -232,14 +298,17 @@ fn check_values(settings: &mut Settings) -> Result<()> {
         )));
     }
     settings.tld = tld;
+    settings.normalize();
     if !(1..=32).contains(&settings.php_workers) {
         return Err(Error::msg("PHP workers must be between 1 and 32."));
     }
     let p = &settings.ports;
     for (port, name) in [
-        (p.http, "Apache HTTP"), (p.https, "Apache HTTPS"), (p.nginx_http, "Nginx HTTP"), (p.nginx_https, "Nginx HTTPS"),
-        (p.mysql, "MariaDB"), (p.mail_smtp, "Mailpit SMTP"), (p.mail_ui, "Mailpit inbox"), (p.redis, "Redis"),
-        (p.memcached, "Memcached"), (p.php_fpm, "PHP FastCGI"),
+        (p.http, "HTTP"), (p.https, "HTTPS"), (p.nginx_http, "Nginx HTTP"), (p.nginx_https, "Nginx HTTPS"),
+        (p.apache_http, "Apache HTTP"), (p.apache_https, "Apache HTTPS"), (p.caddy_http, "Caddy HTTP"), (p.caddy_https, "Caddy HTTPS"),
+        (p.caddy_admin, "Caddy admin"), (p.frankenphp_http, "FrankenPHP HTTP"), (p.frankenphp_https, "FrankenPHP HTTPS"),
+        (p.frankenphp_admin, "FrankenPHP admin"), (p.tomcat_http, "Tomcat HTTP"), (p.tomcat_shutdown, "Tomcat shutdown"), (p.mysql, "MariaDB"), (p.mail_smtp, "Mailpit SMTP"), (p.mail_ui, "Mailpit inbox"), (p.redis, "Redis"),
+        (p.memcached, "Memcached"), (p.php_fpm, "PHP FastCGI"), (p.postgres, "PostgreSQL"), (p.pgadmin, "pgAdmin"), (p.mongodb, "MongoDB"), (p.clickhouse_http, "ClickHouse HTTP"), (p.clickhouse_tcp, "ClickHouse native"), (p.neo4j_http, "Neo4j Browser"), (p.neo4j_bolt, "Neo4j Bolt"), (p.meilisearch, "Meilisearch"), (p.typesense, "Typesense"), (p.rustfs, "RustFS"), (p.rustfs_console, "RustFS console"), (p.ollama, "Ollama"), (p.minio, "MinIO"), (p.minio_console, "MinIO console"), (p.elasticsearch, "Elasticsearch"), (p.elasticsearch_transport, "Elasticsearch transport"), (p.opensearch, "OpenSearch"), (p.opensearch_transport, "OpenSearch transport"), (p.n8n, "n8n"), (p.rabbitmq, "RabbitMQ"), (p.rabbitmq_management, "RabbitMQ console"),
     ] {
         if port == 0 {
             return Err(Error::msg(format!("Choose a port for {name} (1–65535).")));
@@ -290,15 +359,46 @@ fn check_ports(settings: &Settings) -> Result<()> {
         (p.mail_smtp, "Mailpit SMTP".into()),
         (p.mail_ui, "Mailpit inbox".into()),
         (p.redis, "Redis".into()),
+        (p.postgres, "PostgreSQL".into()),
+        (p.pgadmin, "pgAdmin".into()),
+        (p.mongodb, "MongoDB".into()),
+        (p.clickhouse_http, "ClickHouse HTTP".into()),
+        (p.clickhouse_tcp, "ClickHouse native".into()),
+        (p.neo4j_http, "Neo4j Browser".into()),
+        (p.neo4j_bolt, "Neo4j Bolt".into()),
+        (p.meilisearch, "Meilisearch".into()),
+        (p.typesense, "Typesense".into()),
+        (p.rustfs, "RustFS".into()),
+        (p.rustfs_console, "RustFS console".into()),
+        (p.ollama, "Ollama".into()),
+        (p.minio, "MinIO".into()),
+        (p.minio_console, "MinIO console".into()),
+        (p.elasticsearch, "Elasticsearch".into()),
+        (p.elasticsearch_transport, "Elasticsearch transport".into()),
+        (p.opensearch, "OpenSearch".into()),
+        (p.opensearch_transport, "OpenSearch transport".into()),
+        (p.n8n, "n8n".into()),
+        (p.rabbitmq, "RabbitMQ".into()),
+        (p.rabbitmq_management, "RabbitMQ console".into()),
         (p.memcached, "Memcached".into()),
     ];
-    for server in [Server::Apache, Server::Nginx] {
+    for server in Server::ALL {
         if settings.server_enabled(server) {
             let (http, https) = settings.server_ports(server);
-            let name = if server == Server::Apache { "Apache" } else { "Nginx" };
+            let name = server.label();
             used.push((http, format!("{name} HTTP")));
             used.push((https, format!("{name} HTTPS")));
         }
+    }
+    if settings.server_enabled(Server::Caddy) {
+        used.push((p.caddy_admin, "Caddy admin".into()));
+    }
+    if settings.server_enabled(Server::Frankenphp) {
+        used.push((p.frankenphp_admin, "FrankenPHP admin".into()));
+    }
+    if settings.versions.get("tomcat").is_some() {
+        used.push((p.tomcat_http, "Tomcat HTTP".into()));
+        used.push((p.tomcat_shutdown, "Tomcat shutdown".into()));
     }
     let php_block = p.php_fpm..p.php_fpm.saturating_add(100);
     for (i, (port, a)) in used.iter().enumerate() {
@@ -316,14 +416,250 @@ fn check_ports(settings: &Settings) -> Result<()> {
     Ok(())
 }
 
+/// The service of a database engine, which has to be running for its tools to connect.
+async fn running_database(state: &AppState, engine: templates::DbEngine) -> Result<()> {
+    let kind = match engine {
+        templates::DbEngine::Mariadb => ServiceKind::Mariadb,
+        templates::DbEngine::Mysql => ServiceKind::Mysql,
+        templates::DbEngine::Postgres => ServiceKind::Postgres,
+        templates::DbEngine::Mongodb => ServiceKind::Mongodb,
+        // Files in the projects: nothing has to run.
+        templates::DbEngine::Sqlite => return Ok(()),
+    };
+    if state.supervisor.is_running(kind).await {
+        Ok(())
+    } else {
+        Err(Error::msg(format!("Start {} first: backups are made and restored through the running server.", engine.label())))
+    }
+}
+
+#[tauri::command]
+async fn list_databases(state: State<'_, AppState>, engine: templates::DbEngine) -> Result<Vec<String>> {
+    running_database(&state, engine).await?;
+    let (settings, layout) = state.snapshot().await;
+    backups::databases(&settings, &layout, engine).await
+}
+
+#[tauri::command]
+async fn list_backups(state: State<'_, AppState>) -> Result<Vec<backups::Backup>> {
+    Ok(backups::list(&state.snapshot().await.1))
+}
+
+#[tauri::command]
+async fn backup_database(app: AppHandle, state: State<'_, AppState>, engine: templates::DbEngine, database: String) -> Result<backups::Backup> {
+    running_database(&state, engine).await?;
+    let (settings, layout) = state.snapshot().await;
+    let backup = backups::create(&settings, &layout, engine, &database).await?;
+    logs::system(&app, logs::Level::Info, format!("Backed up {} database {database} to {}", engine.label(), backup.path.display()));
+    Ok(backup)
+}
+
+#[tauri::command]
+async fn restore_backup(app: AppHandle, state: State<'_, AppState>, engine: templates::DbEngine, path: PathBuf, database: String) -> Result<()> {
+    running_database(&state, engine).await?;
+    let (settings, layout) = state.snapshot().await;
+    logs::system(&app, logs::Level::Info, format!("Restoring {} into {} database {database}", path.display(), engine.label()));
+    backups::restore(&settings, &layout, engine, &path, &database).await?;
+    logs::system(&app, logs::Level::Info, format!("Restored {database}"));
+    Ok(())
+}
+
+/// Set on the first run, until the LampRabit folder's place is confirmed.
+struct FirstRun(std::sync::atomic::AtomicBool);
+
+/// Whether this is the first run, when the app asks where the LampRabit folder goes.
+#[tauri::command]
+fn first_run(flag: State<'_, FirstRun>) -> bool {
+    flag.0.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The LampRabit folder's place is settled: the settings are written, so later runs
+/// don't ask again.
+#[tauri::command]
+async fn finish_first_run(app: AppHandle, state: State<'_, AppState>, flag: State<'_, FirstRun>) -> Result<()> {
+    flag.0.store(false, std::sync::atomic::Ordering::Relaxed);
+    let settings = state.update_settings(|_| {}).await?;
+    logs::system(&app, logs::Level::Info, format!("LampRabit's folder is {}", settings.root_dir.display()));
+    Ok(())
+}
+
+/// Whether a folder can hold the LampRabit folder, and what moving there involves.
+#[tauri::command]
+async fn check_move_target(state: State<'_, AppState>, target: PathBuf) -> Result<relocate::MoveCheck> {
+    let root = state.snapshot().await.1.root().to_path_buf();
+    Ok(tauri::async_runtime::spawn_blocking(move || relocate::check(&root, &target)).await.map_err(|e| Error::msg(e.to_string()))?)
+}
+
+/// Programs other than LampRabit that keep the folder busy.
+#[tauri::command]
+async fn environment_in_use(state: State<'_, AppState>) -> Result<Vec<relocate::Holder>> {
+    let root = state.snapshot().await.1.root().to_path_buf();
+    Ok(relocate::holders(&root))
+}
+
+#[tauri::command]
+async fn stop_environment_holder(app: AppHandle, state: State<'_, AppState>, pid: u32) -> Result<()> {
+    let root = state.snapshot().await.1.root().to_path_buf();
+    relocate::stop_holder(&root, pid)?;
+    logs::system(&app, logs::Level::Info, format!("Stopped process {pid}, which was using the LampRabit folder"));
+    Ok(())
+}
+
+/// Moves the LampRabit folder to `target`: stops everything that runs from it, moves it
+/// (all or nothing), repairs what records absolute paths, and switches the settings,
+/// shims and PATH over. Services aren't restarted; the user starts what they need.
+#[tauri::command]
+async fn move_environment(app: AppHandle, state: State<'_, AppState>, target: PathBuf) -> Result<Settings> {
+    let _op = state.ops.lock().await;
+    let (settings, layout) = state.snapshot().await;
+    let old = layout.root().to_path_buf();
+    let check = {
+        let (old, target) = (old.clone(), target.clone());
+        tauri::async_runtime::spawn_blocking(move || relocate::check(&old, &target)).await.map_err(|e| Error::msg(e.to_string()))?
+    };
+    if !check.problems.is_empty() {
+        return Err(Error::msg(check.problems.join(" ")));
+    }
+    logs::system(&app, logs::Level::Info, format!("Moving the LampRabit folder from {} to {}", old.display(), target.display()));
+    // Everything LampRabit runs from the folder stops first.
+    let running: Vec<ServiceKind> = state.supervisor.pids().await.into_values().collect();
+    for &kind in &running {
+        state.supervisor.stop(&app, kind).await;
+    }
+    for kind in running {
+        state.supervisor.wait_stopped(kind).await;
+    }
+    state.apps.stop_all().await;
+    state.tunnels.stop_all().await;
+    state.supervisor.php.stop_all(&app).await;
+    let busy = relocate::holders(&old);
+    if !busy.is_empty() {
+        let names: Vec<String> = busy.iter().map(|h| format!("{} (PID {})", h.name, h.pid)).collect();
+        return Err(Error::msg(format!("These programs still use the folder: {}. Stop them and try again.", names.join(", "))));
+    }
+    if settings.add_to_path {
+        let _ = shims::set_on_path(&layout, false);
+    }
+    let (from, to, same) = (old.clone(), target.clone(), check.same_drive);
+    let app2 = app.clone();
+    let moved = tauri::async_runtime::spawn_blocking(move || relocate::move_root(&app2, &from, &to, same)).await.map_err(|e| Error::msg(e.to_string()))?;
+    if let Err(e) = moved {
+        if settings.add_to_path {
+            let _ = shims::set_on_path(&layout, true);
+        }
+        logs::system(&app, logs::Level::Error, e.to_string());
+        return Err(e);
+    }
+    relocate::repair_venvs(&old, &target);
+    let settings = state.update_settings(|s| s.root_dir = target.clone()).await?;
+    let layout = Layout::new(&settings.root_dir);
+    if settings.add_to_path {
+        if let Err(e) = shims::set_on_path(&layout, true) {
+            logs::system(&app, logs::Level::Warn, format!("Couldn't put the new shims folder on PATH: {e}"));
+        }
+    }
+    *state.ca_trusted.lock().await = None;
+    logs::set_system_file(&app, layout.logs().join("lampRabit.log"));
+    logs::system(&app, logs::Level::Info, format!("The LampRabit folder is now {}", target.display()));
+    Ok(settings)
+}
+
+/// Sets the version a Python or Java project uses, by writing its version file (None
+/// removes it, back to the active version); its shims follow straight away.
+#[tauri::command]
+async fn set_language_version(app: AppHandle, state: State<'_, AppState>, name: String, version: Option<String>) -> Result<()> {
+    let (settings, layout) = state.snapshot().await;
+    let dir = layout.www().join(&name);
+    let runtime = match sites::language(&dir) {
+        sites::Language::Python => "python",
+        sites::Language::Java => "java",
+        sites::Language::Go => "go",
+        sites::Language::Rust => "rust",
+        _ => return Err(Error::msg("This project's language has no version to choose.")),
+    };
+    langver::set(&dir, runtime, version.as_deref())?;
+    refresh_shims(&app, &settings);
+    Ok(())
+}
+
+/// Where an Ollama installed outside LampRabit is, if there is one.
+#[tauri::command]
+fn ollama_elsewhere() -> Option<PathBuf> {
+    runtimes::ollama_elsewhere()
+}
+
+/// Opens MongoDB Compass connected to LampRabit's MongoDB.
+#[tauri::command]
+async fn open_compass(state: State<'_, AppState>) -> Result<()> {
+    let (settings, layout) = state.snapshot().await;
+    let version = settings.versions.get("compass").ok_or_else(|| Error::msg("Install MongoDB Compass first (Services)."))?;
+    let home = layout.bin("compass", version);
+    let program = runtimes::compass_program(&home).ok_or_else(|| Error::msg("Compass's install looks incomplete. Remove it on the Services page and install it again."))?;
+    let uri = format!("mongodb://127.0.0.1:{}", settings.ports.mongodb);
+    let mut cmd = if cfg!(target_os = "macos") {
+        let mut c = std::process::Command::new("open");
+        c.arg("-a").arg(&program).arg("--args").arg(&uri);
+        c
+    } else {
+        let mut c = std::process::Command::new(&program);
+        c.arg(&uri);
+        c
+    };
+    cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    cmd.spawn().map_err(|e| Error::msg(format!("Couldn't open Compass: {e}")))?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn delete_backup(state: State<'_, AppState>, path: PathBuf) -> Result<()> {
+    backups::delete(&state.snapshot().await.1, &path)
+}
+
+/// Makes a new project's domain work right away: its certificate is issued, the local CA
+/// trusted and the hosts file updated now, so the admin prompts come while the user is
+/// watching the wizard instead of later, when a web server happens to start. A cancelled
+/// prompt doesn't fail the project; the Sites page offers the same fixes.
+async fn prepare_new_site(app: &AppHandle, state: &AppState, name: &str) {
+    let (settings, layout) = state.snapshot().await;
+    let served = sites::served(&settings, &layout);
+    if let Some(site) = served.iter().find(|s| s.name == name && s.ssl) {
+        match ssl::ensure_ca(&layout).and_then(|(ca, _)| ssl::ensure_site_cert(&layout, &ca, &site.domain)) {
+            Ok(_) if !ssl::ca_trusted(&layout).await => {
+                *state.ca_trusted.lock().await = None;
+                if let Err(e) = ssl::trust_ca(&layout).await {
+                    logs::system(app, logs::Level::Warn, format!("{e} Browsers will warn about {} until LampRabit's certificate authority is trusted (Sites page).", site.domain));
+                }
+            }
+            Ok(_) => {}
+            Err(e) => logs::system(app, logs::Level::Warn, format!("Couldn't create a certificate for {}: {e}", site.domain)),
+        }
+    }
+    if settings.manage_hosts && sites::needs_hosts_file(&settings) && !sites::hosts_in_sync(&served) {
+        match sites::update_hosts(&layout, &served).await {
+            Ok(()) => logs::system(app, logs::Level::Info, "Hosts file updated"),
+            Err(e) => logs::system(app, logs::Level::Warn, format!("{e} The new domain may not resolve until the hosts file is updated (Sites page).")),
+        }
+    }
+}
+
 /// Restarts whichever web servers are running, so they (and their PHP pools) pick up
 /// changed sites or PHP versions together.
 async fn restart_web_servers(app: &AppHandle, state: &AppState) -> Result<()> {
     let mut running = Vec::new();
-    for kind in [ServiceKind::Apache, ServiceKind::Nginx] {
+    for kind in ServiceKind::WEB {
         if state.supervisor.is_running(kind).await {
             state.supervisor.stop(app, kind).await;
             running.push(kind);
+        }
+    }
+    // Tomcat reads its hosts only at start; restart it when the Java apps changed.
+    {
+        let (settings, layout) = state.snapshot().await;
+        if state.supervisor.is_running(ServiceKind::Tomcat).await
+            && configs::tomcat_stale(&settings, &layout, &sites::tomcat_apps(&settings, &layout))
+        {
+            state.supervisor.stop(app, ServiceKind::Tomcat).await;
+            running.push(ServiceKind::Tomcat);
         }
     }
     for &kind in &running {
@@ -358,7 +694,55 @@ async fn list_services(state: State<'_, AppState>) -> Result<Vec<ServiceInfo>> {
 async fn start_service(app: AppHandle, state: State<'_, AppState>, kind: ServiceKind) -> Result<()> {
     let _op = state.ops.lock().await;
     let (settings, layout) = state.snapshot().await;
-    state.supervisor.start(&app, kind, &settings, &layout).await
+    state.supervisor.start(&app, kind, &settings, &layout).await?;
+    serve_tool_domain(&app, &state, kind).await;
+    Ok(())
+}
+
+/// Services with a web UI of their own at a .test domain (n8n.test, pgadmin.test…), which
+/// the primary web server proxies.
+fn tool_domain_service(kind: ServiceKind) -> bool {
+    matches!(kind, ServiceKind::N8n | ServiceKind::Pgadmin | ServiceKind::Neo4j | ServiceKind::Mailpit)
+}
+
+/// Makes a just-started service's .test domain answer: the primary web server is started
+/// when it isn't running (which also brings the hosts file up to date), or reloaded when
+/// its config doesn't have the domain yet. A failure is logged; the service itself runs.
+async fn serve_tool_domain(app: &AppHandle, state: &AppState, kind: ServiceKind) {
+    if !tool_domain_service(kind) {
+        return;
+    }
+    let (settings, layout) = state.snapshot().await;
+    let web = server_kind(settings.primary_server());
+    let result = if !state.supervisor.is_running(web).await {
+        let installed = state.supervisor.list(&settings, &layout).await.iter().any(|s| s.kind == web && s.installed);
+        if !installed {
+            return;
+        }
+        logs::system(app, logs::Level::Info, format!("Starting {} so {}'s .test address works", web.label(), kind.label()));
+        state.supervisor.start(app, web, &settings, &layout).await
+    } else {
+        let served = sites::served(&settings, &layout);
+        let plan = php::plan(&settings, &layout, &served);
+        if !sites::config_stale(&settings, &layout, &served, &plan, settings.primary_server()) {
+            return;
+        }
+        // A reload doesn't touch the hosts file the way a start does.
+        services::sync_hosts(app, &settings, &layout, &served).await;
+        match state.supervisor.reload(app, web, &settings, &layout).await {
+            Ok(true) => Ok(()),
+            // No graceful reload (Apache on Windows): a quick restart instead.
+            Ok(false) => {
+                state.supervisor.stop(app, web).await;
+                state.supervisor.wait_stopped(web).await;
+                state.supervisor.start(app, web, &settings, &layout).await
+            }
+            Err(e) => Err(e),
+        }
+    };
+    if let Err(e) = result {
+        logs::system(app, logs::Level::Warn, format!("{}'s .test address may not work yet: {e}", kind.label()));
+    }
 }
 
 #[tauri::command]
@@ -425,6 +809,29 @@ async fn stop_all(app: AppHandle, state: State<'_, AppState>) -> Result<()> {
     Ok(())
 }
 
+/// Stops the project processes in `stop`, then starts those in `start` ("project/process"),
+/// for stack profiles. Returns one message per process that failed to start; a process
+/// that no longer exists is skipped.
+#[tauri::command]
+async fn apply_processes(app: AppHandle, state: State<'_, AppState>, start: Vec<String>, stop: Vec<String>) -> Result<Vec<String>> {
+    for key in &stop {
+        state.apps.stop(&app, key).await;
+    }
+    let (settings, layout) = state.snapshot().await;
+    let mut errors = Vec::new();
+    for key in &start {
+        let Some((project, process)) = key.split_once('/') else { continue };
+        let exists = settings.sites.get(project).is_some_and(|s| s.processes.iter().any(|p| p.name == process));
+        if !exists {
+            continue;
+        }
+        if let Err(e) = state.apps.start_process(&app, &settings, &layout, project, process).await {
+            errors.push(format!("{key}: {e}"));
+        }
+    }
+    Ok(errors)
+}
+
 /// Stops `stop`, then starts `start` (installed and enabled ones only), in one go: what
 /// selection actions, stack profiles and Start/Stop all run. Returns one message per
 /// service that failed to start.
@@ -450,6 +857,13 @@ async fn apply_services(
         }
         if let Err(e) = state.supervisor.start(&app, info.kind, &settings, &layout).await {
             errors.push(format!("{}: {e}", info.label));
+        }
+    }
+    // Started together with the web server (Start all), the domains are already in its
+    // config; on their own (a profile without it), it's brought up for them.
+    for kind in start.into_iter().filter(|k| tool_domain_service(*k)) {
+        if state.supervisor.is_running(kind).await {
+            serve_tool_domain(&app, &state, kind).await;
         }
     }
     Ok(errors)
@@ -563,13 +977,16 @@ async fn list_sites(state: State<'_, AppState>) -> Result<SitesInfo> {
     let served = sites::served(&settings, &layout);
     let plan = php::plan(&settings, &layout, &served);
     let mut needs_apply = false;
-    for kind in [ServiceKind::Apache, ServiceKind::Nginx] {
+    for kind in ServiceKind::WEB {
         if state.supervisor.is_running(kind).await {
             needs_apply |= sites::config_stale(&settings, &layout, &served, &plan, kind.web_server().unwrap());
         }
     }
     let hosts_ok = !sites::needs_hosts_file(&settings) || sites::hosts_in_sync(&served);
     let (tools, sites): (Vec<_>, Vec<_>) = served.into_iter().partition(|s| s.tool.is_some());
+    // A project's subdomains are served as copies of it (for configs, certificates and the
+    // hosts file); the app shows them on their project, not as projects of their own.
+    let sites: Vec<_> = sites.into_iter().filter(|s| !sites::is_extra(s)).collect();
     let ca_trusted = if sites.iter().any(|s| s.ssl) && ssl::ca_thumbprint(&layout).is_some() {
         let mut cached = state.ca_trusted.lock().await;
         if cached.is_none() {
@@ -600,10 +1017,19 @@ async fn list_sites(state: State<'_, AppState>) -> Result<SitesInfo> {
 #[tauri::command]
 async fn apply_sites(app: AppHandle, state: State<'_, AppState>) -> Result<()> {
     let _op = state.ops.lock().await;
-    let (settings, layout) = state.snapshot().await;
     logs::system(&app, logs::Level::Info, "Applying site changes");
-    let any_running =
-        state.supervisor.is_running(ServiceKind::Apache).await || state.supervisor.is_running(ServiceKind::Nginx).await;
+    sync_sites(&app, &state).await
+}
+
+/// Restarts the running web servers (vhosts, certificates) or, with none running, syncs
+/// the hosts file; for changes to the list of projects.
+async fn sync_sites(app: &AppHandle, state: &AppState) -> Result<()> {
+    let (settings, layout) = state.snapshot().await;
+    let app = app.clone();
+    let mut any_running = false;
+    for kind in ServiceKind::WEB {
+        any_running |= state.supervisor.is_running(kind).await;
+    }
     if any_running {
         restart_web_servers(&app, &state).await
     } else {
@@ -640,22 +1066,47 @@ async fn set_site_php(app: AppHandle, state: State<'_, AppState>, name: String, 
     restart_web_servers(&app, &state).await
 }
 
+/// Turns FrankenPHP's worker mode on or off for a site.
+#[tauri::command]
+async fn set_site_worker(app: AppHandle, state: State<'_, AppState>, name: String, enabled: bool) -> Result<()> {
+    let _op = state.ops.lock().await;
+    state.update_settings(|s| s.sites.entry(name.clone()).or_default().worker = enabled).await?;
+    logs::system(&app, logs::Level::Info, format!("Worker mode {} for {name}", if enabled { "on" } else { "off" }));
+    restart_web_servers(&app, &state).await
+}
+
+/// Reloads the code of FrankenPHP's workers (they keep the app in memory between requests)
+/// through its admin API, without stopping the server.
+#[tauri::command]
+async fn restart_frankenphp_workers(app: AppHandle, state: State<'_, AppState>) -> Result<()> {
+    if !state.supervisor.is_running(ServiceKind::Frankenphp).await {
+        return Err(Error::msg("FrankenPHP isn't running; its workers load the current code when it starts."));
+    }
+    let (settings, _) = state.snapshot().await;
+    let url = format!("http://127.0.0.1:{}/frankenphp/workers/restart", settings.ports.frankenphp_admin);
+    let response = state.http.post(&url).send().await.map_err(|e| Error::msg(format!("Couldn't reach FrankenPHP's admin API: {e}")))?;
+    if !response.status().is_success() {
+        return Err(Error::msg(format!("FrankenPHP didn't restart its workers ({}). Restart FrankenPHP on Home instead.", response.status())));
+    }
+    logs::system(&app, logs::Level::Info, "FrankenPHP's workers restarted");
+    Ok(())
+}
+
 /// Picks the web server for a site when both are enabled.
 #[tauri::command]
 async fn set_site_server(app: AppHandle, state: State<'_, AppState>, name: String, server: Option<config::Server>) -> Result<()> {
     let _op = state.ops.lock().await;
     state.update_settings(|s| s.sites.entry(name.clone()).or_default().server = server).await?;
-    logs::system(&app, logs::Level::Info, format!("{name} is now served by {}", match server {
-        Some(config::Server::Nginx) => "Nginx",
-        Some(config::Server::Apache) => "Apache",
-        None => "the default server",
-    }));
+    logs::system(&app, logs::Level::Info, format!("{name} is now served by {}", server.map_or("the default server", |s| s.label())));
     restart_web_servers(&app, &state).await?;
     // The site now needs its new server; start it when a web server was serving sites.
     let (settings, layout) = state.snapshot().await;
-    let kind = if sites::site_server(&settings, &name) == config::Server::Nginx { ServiceKind::Nginx } else { ServiceKind::Apache };
-    let other = if kind == ServiceKind::Nginx { ServiceKind::Apache } else { ServiceKind::Nginx };
-    if !state.supervisor.is_running(kind).await && state.supervisor.is_running(other).await {
+    let kind = server_kind(sites::site_server(&settings, &name));
+    let mut others_running = false;
+    for other in ServiceKind::WEB.into_iter().filter(|&k| k != kind) {
+        others_running |= state.supervisor.is_running(other).await;
+    }
+    if !state.supervisor.is_running(kind).await && others_running {
         state.supervisor.start(&app, kind, &settings, &layout).await?;
     }
     Ok(())
@@ -686,15 +1137,36 @@ async fn create_project(app: AppHandle, state: State<'_, AppState>, request: pro
     let result = async {
         let creates_database = template.steps.iter().any(|s| matches!(s.action, templates::Action::CreateDatabase(_)));
         if request.database.is_some() && creates_database {
-            let server = settings.database().ok_or_else(|| Error::msg("Install MariaDB or MySQL first (Services)."))?;
-            let kind = database_service(server);
+            use templates::DbEngine;
+            let engine = projects::engine(&settings, &request).ok_or_else(|| Error::msg("Install MariaDB, MySQL or PostgreSQL first (Services)."))?;
+            if !template.engines.contains(&engine) {
+                let supported: Vec<&str> = template.engines.iter().map(|e| e.label()).collect();
+                return Err(Error::msg(format!("{} projects can use {}, not {}.", template.name, supported.join(" or "), engine.label())));
+            }
+            let kind = match engine {
+                DbEngine::Mariadb => ServiceKind::Mariadb,
+                DbEngine::Mysql => ServiceKind::Mysql,
+                DbEngine::Postgres => ServiceKind::Postgres,
+                DbEngine::Mongodb => ServiceKind::Mongodb,
+                // Nothing to start: PHP has SQLite built in.
+                DbEngine::Sqlite => return projects::build(&ctx, &request, &template, source, &url).await,
+            };
+            if settings.versions.get(engine.id()).is_none() {
+                return Err(Error::msg(format!("Install {} first (Services).", engine.label())));
+            }
             if !state.supervisor.is_running(kind).await {
-                ctx.step(format!("Starting {}", server.label()));
+                ctx.step(format!("Starting {}", engine.label()));
                 state.supervisor.start(&app, kind, &settings, &layout).await?;
             }
             // The process is up before it accepts connections.
             for _ in 0..30 {
-                if matches!(diagnose::probe_mysql(settings.database_port(server)).await, diagnose::Probe::Ok) {
+                let probe = match engine {
+                    DbEngine::Postgres => diagnose::probe_postgres(settings.ports.postgres).await,
+                    DbEngine::Mongodb | DbEngine::Sqlite => diagnose::Probe::Ok,
+                    DbEngine::Mysql => diagnose::probe_mysql(settings.ports.mysql_server).await,
+                    DbEngine::Mariadb => diagnose::probe_mysql(settings.ports.mysql).await,
+                };
+                if matches!(probe, diagnose::Probe::Ok) {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -718,8 +1190,30 @@ async fn create_project(app: AppHandle, state: State<'_, AppState>, request: pro
         app_config.port = apps::free_port(&*state.settings.read().await);
         state.update_settings(|s| s.sites.entry(name.clone()).or_default().app = Some(app_config)).await?;
     }
+    // The template's processes ("auto" ports picked one by one, so they differ) and subdomains.
+    if !built.processes.is_empty() || !built.domains.is_empty() {
+        let mut scratch = state.settings.read().await.clone();
+        let mut processes = built.processes;
+        for i in 0..processes.len() {
+            if processes[i].port == Some(0) {
+                processes[i].port = Some(apps::free_port(&scratch));
+            }
+            scratch.sites.entry(name.clone()).or_default().processes = processes[..=i].to_vec();
+        }
+        let parent = format!("{}.{}", sites::label(&name).unwrap_or_default(), scratch.tld);
+        let domains: Vec<config::ExtraDomain> = built.domains.into_iter().map(|(sub, target)| config::ExtraDomain { host: format!("{sub}.{parent}"), target }).collect();
+        state
+            .update_settings(|s| {
+                let own = s.sites.entry(name.clone()).or_default();
+                own.processes = processes;
+                own.domains = domains;
+            })
+            .await?;
+    }
     // Composer may have just been installed; this makes it the active version and adds its shim.
     state.update_settings(reconcile_versions).await?;
+    ctx.step("Setting up HTTPS and the hosts file");
+    prepare_new_site(&app, &state, &name).await;
     ctx.step("Adding the site to the web server");
     restart_web_servers(&app, &state).await?;
     logs::system(&app, logs::Level::Info, format!("Created project {name} at {url}"));
@@ -738,6 +1232,44 @@ struct CreatedProject {
 async fn list_templates(state: State<'_, AppState>) -> Result<templates::Catalog> {
     let (_, layout) = state.snapshot().await;
     Ok(templates::catalog(&layout))
+}
+
+/// A template that recreates the project, as YAML for the template editor.
+#[tauri::command]
+async fn template_from_project(state: State<'_, AppState>, name: String) -> Result<String> {
+    let (settings, layout) = state.snapshot().await;
+    let dir = project_dir(&layout, &name)?;
+    let site = sites::scan(&settings, &layout).into_iter().find(|s| s.name == name);
+    let facts = facts::read(&dir, site.as_ref().and_then(|s| s.framework.as_deref()), "npm").await;
+    let php = site.as_ref().filter(|s| s.language == sites::Language::Php).and_then(|s| s.php.clone().or_else(|| settings.versions.php.clone()));
+    let has_database = site.as_ref().is_some_and(|s| s.database.is_some());
+    Ok(templategen::generate(&templategen::Setup {
+        name: &name,
+        dir: &dir,
+        remote: facts.git.and_then(|g| g.remote),
+        php,
+        engine: has_database.then(|| manage::engine(&settings, &dir)).flatten(),
+        has_database,
+        own: settings.sites.get(&name),
+        parent: format!("{}.{}", sites::label(&name).unwrap_or_default(), settings.tld),
+    }))
+}
+
+/// Saves a template's YAML into the templates folder after the same checks loading does.
+/// An existing template with its id is replaced only when `replace` says so.
+#[tauri::command]
+async fn save_template(app: AppHandle, state: State<'_, AppState>, yaml: String, replace: bool) -> Result<String> {
+    let (_, layout) = state.snapshot().await;
+    let template = templates::parse_text(&yaml).map_err(|e| Error::msg(format!("The template isn't valid yet: {e}")))?;
+    let dir = templates::folder(&layout);
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{}.yaml", template.id));
+    if path.exists() && !replace {
+        return Err(Error::msg(format!("You already have a template with the id {}. Change the id, or replace it.", template.id)));
+    }
+    std::fs::write(&path, yaml)?;
+    logs::system(&app, logs::Level::Info, format!("Saved template {} ({})", template.name, path.display()));
+    Ok(template.id)
 }
 
 /// Opens the folder for your own templates, creating it with an example the first time.
@@ -834,7 +1366,7 @@ async fn prepare_app(app: &AppHandle, state: &AppState, name: &str) -> Result<Op
         let to_save = config.clone();
         state.update_settings(|s| s.sites.entry(name.to_string()).or_default().app = Some(to_save)).await?;
     }
-    if !config.serve || sites::language(&dir) != sites::Language::Node {
+    if !config.serve || matches!(sites::language(&dir), sites::Language::Php | sites::Language::Static) {
         return Ok(None);
     }
     let kind = server_kind(sites::site_server(&settings, name));
@@ -853,17 +1385,53 @@ async fn prepare_app(app: &AppHandle, state: &AppState, name: &str) -> Result<Op
 }
 
 fn server_kind(server: config::Server) -> ServiceKind {
-    if server == config::Server::Nginx { ServiceKind::Nginx } else { ServiceKind::Apache }
+    ServiceKind::for_server(server)
 }
 
 /// Keeps every project's domain pointed at what it's serving: the port its processes
 /// listen on (a dev server from LampRabit or your own terminal), or its files when nothing
 /// listens. Runs every few seconds, and straight away when an app starts or stops.
+/// Processes set to start with LampRabit, then, once a minute, the ones whose schedule
+/// fires (a scheduled process already running is left alone).
+fn spawn_process_schedules(handle: &AppHandle) {
+    let handle = handle.clone();
+    tauri::async_runtime::spawn(async move {
+        let state = handle.state::<AppState>();
+        let (settings, layout) = state.snapshot().await;
+        for (project, own) in &settings.sites {
+            for p in own.processes.iter().filter(|p| p.at_launch) {
+                if let Err(e) = state.apps.start_process(&handle, &settings, &layout, project, &p.name).await {
+                    logs::system(&handle, logs::Level::Warn, &format!("{project}/{}: couldn't start on launch: {e}", p.name));
+                }
+            }
+        }
+        loop {
+            // Wake just after each minute turns, so a "0 3 * * *" job runs at 3:00, not 3:00:59.
+            let now = time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+            tokio::time::sleep(std::time::Duration::from_secs(61 - u64::from(now.second()))).await;
+            let now = time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+            let (settings, layout) = state.snapshot().await;
+            for (project, own) in &settings.sites {
+                for p in &own.processes {
+                    let Ok(schedule) = cron::Schedule::parse(p.schedule.trim()) else { continue };
+                    if schedule.matches(now) {
+                        if let Err(e) = state.apps.start_process(&handle, &settings, &layout, project, &p.name).await {
+                            logs::system(&handle, logs::Level::Warn, &format!("{project}/{}: the scheduled start failed: {e}", p.name));
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
 async fn watch_ports(handle: AppHandle) {
     let mut system = sysinfo::System::new();
     // A route is dropped only after its port has been gone for two scans, so a dev server
     // restarting itself (on a config change) doesn't flip the site to its files and back.
     let mut missing: std::collections::BTreeMap<String, u8> = Default::default();
+    // What the projects' version files ask for; the shims are rewritten when it changes.
+    let mut versions = String::new();
     loop {
         tokio::select! {
             _ = tokio::time::sleep(std::time::Duration::from_secs(3)) => {}
@@ -871,6 +1439,13 @@ async fn watch_ports(handle: AppHandle) {
         }
         let state = handle.state::<AppState>();
         let (settings, layout) = state.snapshot().await;
+        let now = langver::signature(&layout);
+        if now != versions {
+            if !versions.is_empty() {
+                refresh_shims(&handle, &settings);
+            }
+            versions = now;
+        }
         let sites = sites::scan(&settings, &layout);
         let projects: Vec<(String, PathBuf)> = sites.iter().map(|s| (s.name.clone(), s.path.clone())).collect();
         let Ok((found, back)) = tauri::async_runtime::spawn_blocking(move || {
@@ -894,15 +1469,26 @@ async fn watch_ports(handle: AppHandle) {
         let mut needed: Vec<ServiceKind> = Vec::new();
         for site in &sites {
             let own = settings.sites.get(&site.name);
-            let files_only = site.language == sites::Language::Node && own.and_then(|s| s.app.as_ref()).is_some_and(|a| !a.serve);
+            let files_only = site.language != sites::Language::Php && own.and_then(|s| s.app.as_ref()).is_some_and(|a| !a.serve);
             let status = statuses.iter().find(|s| s.name == site.name);
             let managed = status.filter(|s| matches!(s.state, "starting" | "running")).and_then(|s| s.port);
-            let detected = found.get(&site.name).map(Vec::as_slice).unwrap_or_default();
+            // The project's processes listen on their own ports (Vite, an API); those go to
+            // the domains pointing at them, not to the main domain, unless it's pinned there.
+            let pinned = own.and_then(|s| s.route_port);
+            let reserved: Vec<u16> = own.map(|s| s.processes.iter().filter_map(|p| p.port).filter(|p| Some(*p) != pinned).collect()).unwrap_or_default();
+            let detected: Vec<ports::Detected> = found.get(&site.name).map(|d| d.iter().filter(|d| !reserved.contains(&d.port)).cloned().collect()).unwrap_or_default();
+            let detected = detected.as_slice();
             if let (Some(s), Some(first)) = (status, detected.first()) {
                 if s.state == "starting" {
                     let port = managed.filter(|p| detected.iter().any(|d| d.port == *p)).unwrap_or(first.port);
                     state.apps.mark_ready(&handle, &site.name, port).await;
                 }
+            }
+            // A main domain set by hand goes where it was told (sites::scan), not where ports lead.
+            if own.is_some_and(|s| s.main.is_some()) {
+                next.remove(&site.name);
+                missing.remove(&site.name);
+                continue;
             }
             let want = ports::choose(site.language, files_only, own.and_then(|s| s.route_port), managed, detected);
             if want.as_ref() == current.get(&site.name) {
@@ -1000,13 +1586,156 @@ async fn app_start(app: AppHandle, state: State<'_, AppState>, name: String) -> 
     if let Some(note) = note {
         state.apps.record(&app, &layout, &name, "error", note).await;
     }
+    // Its processes that run with it; one failing doesn't stop the app (its log says why).
+    let _ = state.apps.start_with_app(&app, &settings, &layout, &name).await;
     Ok(status)
 }
 
 #[tauri::command]
 async fn app_stop(app: AppHandle, state: State<'_, AppState>, name: String) -> Result<()> {
     state.apps.stop(&app, &name).await;
+    let (settings, _) = state.snapshot().await;
+    state.apps.stop_processes(&app, &settings, &name, true).await;
     Ok(())
+}
+
+/// Saves a project's extra domains and serves them (new certificates and hosts entries
+/// come with the web server's restart).
+#[tauri::command]
+async fn set_site_domains(app: AppHandle, state: State<'_, AppState>, name: String, domains: Vec<config::ExtraDomain>) -> Result<()> {
+    let _op = state.ops.lock().await;
+    let (settings, layout) = state.snapshot().await;
+    project_dir(&layout, &name)?;
+    let domains: Vec<config::ExtraDomain> = domains
+        .into_iter()
+        .map(|d| config::ExtraDomain { host: d.host.trim().trim_end_matches('.').to_lowercase(), target: d.target })
+        .collect();
+    sites::check_domains(&settings, &layout, &name, &domains)?;
+    let count = domains.len();
+    state.update_settings(|s| s.sites.entry(name.clone()).or_default().domains = domains).await?;
+    logs::system(&app, logs::Level::Info, format!("{name} has {count} extra domain{}", if count == 1 { "" } else { "s" }));
+    restart_web_servers(&app, &state).await
+}
+
+/// Sets where a project's main domain goes: by hand (its files or a folder, a port, a
+/// process), or None to follow what's running.
+#[tauri::command]
+async fn set_site_main(app: AppHandle, state: State<'_, AppState>, name: String, target: Option<config::DomainTarget>) -> Result<()> {
+    let _op = state.ops.lock().await;
+    let (settings, layout) = state.snapshot().await;
+    project_dir(&layout, &name)?;
+    let target = target.filter(|t| *t != config::DomainTarget::Main);
+    if let Some(t) = &target {
+        let host = sites::url_for(&settings, &name).unwrap_or_else(|| name.clone());
+        sites::check_target(&settings, &layout, &name, &host, t)?;
+    }
+    state.update_settings(|s| s.sites.entry(name.clone()).or_default().main = target).await?;
+    ports::poke();
+    restart_web_servers(&app, &state).await
+}
+
+/// A project's folders, for the domain and process folder pickers.
+#[tauri::command]
+async fn project_folders(state: State<'_, AppState>, name: String) -> Result<Vec<String>> {
+    let (_, layout) = state.snapshot().await;
+    let dir = project_dir(&layout, &name)?;
+    Ok(sites::project_folders(&dir))
+}
+
+/// Saves a project's processes. Removed ones are stopped; a changed one keeps running
+/// with its old command until it's restarted.
+#[tauri::command]
+async fn set_site_processes(app: AppHandle, state: State<'_, AppState>, name: String, processes: Vec<config::ProjectProcess>) -> Result<()> {
+    let _op = state.ops.lock().await;
+    let (settings, layout) = state.snapshot().await;
+    project_dir(&layout, &name)?;
+    let mut names = HashSet::new();
+    let app_port = settings.sites.get(&name).and_then(|s| s.app.as_ref()).map(|a| a.port);
+    let mut ports = HashSet::new();
+    for p in &processes {
+        if p.name.is_empty() || !p.name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') || p.name.starts_with('-') {
+            return Err(Error::msg(format!("\"{}\" can't be a process name: use lowercase letters, digits and dashes, like queue or vite.", p.name)));
+        }
+        if !names.insert(p.name.clone()) {
+            return Err(Error::msg(format!("Two processes are called {}.", p.name)));
+        }
+        if p.command.trim().is_empty() {
+            return Err(Error::msg(format!("Enter the command {} runs.", p.name)));
+        }
+        let plain = std::path::Path::new(&p.cwd).components().all(|c| matches!(c, std::path::Component::Normal(_)));
+        if !plain || !layout.www().join(&name).join(&p.cwd).is_dir() {
+            return Err(Error::msg(format!("{}: \"{}\" isn't a folder in {name}.", p.name, p.cwd)));
+        }
+        if !p.schedule.trim().is_empty() {
+            cron::Schedule::parse(p.schedule.trim()).map_err(|e| Error::msg(format!("{}: {e}", p.name)))?;
+        }
+        if let Some(port) = p.port {
+            if port < 1024 || Some(port) == app_port || !ports.insert(port) {
+                return Err(Error::msg(format!("{}: port {port} is taken (below 1024, the app's, or another process's). Pick another one.", p.name)));
+            }
+        }
+    }
+    // A domain can't point at a process that's going away, or that no longer has a port.
+    if let Some(own) = settings.sites.get(&name) {
+        let main = own.main.iter().map(|t| (name.clone(), t));
+        for (host, target) in own.domains.iter().map(|d| (d.host.clone(), &d.target)).chain(main) {
+            if let config::DomainTarget::Process { name: target } = target {
+                if !processes.iter().any(|p| &p.name == target && p.port.is_some()) {
+                    return Err(Error::msg(format!("{host} points to the process {target}. Point it somewhere else first.")));
+                }
+            }
+        }
+    }
+    let removed: Vec<String> = settings.sites.get(&name).map(|s| s.processes.iter().filter(|old| !names.contains(&old.name)).map(|old| old.name.clone()).collect()).unwrap_or_default();
+    for process in &removed {
+        state.apps.stop(&app, &apps::process_key(&name, process)).await;
+    }
+    let ports_changed = settings.sites.get(&name).is_some_and(|s| s.processes.iter().map(|p| (&p.name, p.port)).ne(processes.iter().map(|p| (&p.name, p.port))));
+    state.update_settings(|s| s.sites.entry(name.clone()).or_default().processes = processes).await?;
+    // Domains that point at a process follow its port.
+    let to_process = |t: &config::DomainTarget| matches!(t, config::DomainTarget::Process { .. });
+    if ports_changed && settings.sites.get(&name).is_some_and(|s| s.domains.iter().any(|d| to_process(&d.target)) || s.main.as_ref().is_some_and(to_process)) {
+        restart_web_servers(&app, &state).await?;
+    }
+    ports::poke();
+    Ok(())
+}
+
+#[tauri::command]
+async fn process_start(app: AppHandle, state: State<'_, AppState>, name: String, process: String) -> Result<apps::AppStatus> {
+    let (settings, layout) = state.snapshot().await;
+    state.apps.start_process(&app, &settings, &layout, &name, &process).await
+}
+
+#[tauri::command]
+async fn process_stop(app: AppHandle, state: State<'_, AppState>, name: String, process: String) -> Result<()> {
+    state.apps.stop(&app, &apps::process_key(&name, &process)).await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn process_restart(app: AppHandle, state: State<'_, AppState>, name: String, process: String) -> Result<apps::AppStatus> {
+    state.apps.stop(&app, &apps::process_key(&name, &process)).await;
+    let (settings, layout) = state.snapshot().await;
+    state.apps.start_process(&app, &settings, &layout, &name, &process).await
+}
+
+/// Starts (or stops) all of a project's processes, whether or not they run with the app.
+#[tauri::command]
+async fn processes_all(app: AppHandle, state: State<'_, AppState>, name: String, start: bool) -> Result<()> {
+    let (settings, layout) = state.snapshot().await;
+    if !start {
+        state.apps.stop_processes(&app, &settings, &name, false).await;
+        return Ok(());
+    }
+    let all: Vec<String> = settings.sites.get(&name).map(|s| s.processes.iter().map(|p| p.name.clone()).collect()).unwrap_or_default();
+    let mut errors = Vec::new();
+    for process in all {
+        if let Err(e) = state.apps.start_process(&app, &settings, &layout, &name, &process).await {
+            errors.push(format!("{process}: {e}"));
+        }
+    }
+    if errors.is_empty() { Ok(()) } else { Err(Error::msg(errors.join("\n"))) }
 }
 
 #[tauri::command]
@@ -1104,6 +1833,221 @@ async fn run_project_command(app: AppHandle, state: State<'_, AppState>, name: S
     state.apps.run_command(&app, &settings, &layout, &name, &label, &command).await
 }
 
+/// The project's recent command runs, newest first.
+#[tauri::command]
+async fn command_history(state: State<'_, AppState>, name: String) -> Result<Vec<apps::CommandRun>> {
+    let (_, layout) = state.snapshot().await;
+    Ok(apps::history(&layout, &name))
+}
+
+/// When each of the project's scheduled processes runs next (Unix ms).
+#[tauri::command]
+async fn process_next_runs(state: State<'_, AppState>, name: String) -> Result<std::collections::BTreeMap<String, u64>> {
+    let (settings, _) = state.snapshot().await;
+    let now = time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+    Ok(settings
+        .sites
+        .get(&name)
+        .map(|own| {
+            own.processes
+                .iter()
+                .filter_map(|p| {
+                    let next = cron::Schedule::parse(p.schedule.trim()).ok()?.next(now)?;
+                    Some((p.name.clone(), u64::try_from(next.unix_timestamp_nanos() / 1_000_000).ok()?))
+                })
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// Whether the project's database exists, and its server runs.
+#[tauri::command]
+async fn database_status(state: State<'_, AppState>, name: String) -> Result<Option<manage::DbStatus>> {
+    let (settings, layout) = state.snapshot().await;
+    let dir = project_dir(&layout, &name)?;
+    let Some(database) = sites::scan(&settings, &layout).into_iter().find(|s| s.name == name).and_then(|s| s.database) else { return Ok(None) };
+    let Some(engine) = manage::engine(&settings, &dir) else { return Ok(None) };
+    let running = match engine.service() {
+        Some(kind) => state.supervisor.is_running(kind).await,
+        None => true,
+    };
+    Ok(manage::status(&settings, &layout, &dir, &database, running).await)
+}
+
+/// Creates the database the project's config names.
+#[tauri::command]
+async fn create_project_database(app: AppHandle, state: State<'_, AppState>, name: String) -> Result<()> {
+    let (settings, layout) = state.snapshot().await;
+    let dir = project_dir(&layout, &name)?;
+    let database = sites::scan(&settings, &layout).into_iter().find(|s| s.name == name).and_then(|s| s.database).ok_or_else(|| Error::msg(format!("{name} doesn't name a database in its config.")))?;
+    let engine = manage::engine(&settings, &dir).ok_or_else(|| Error::msg("Install MariaDB, MySQL or PostgreSQL first (Services)."))?;
+    if let Some(kind) = engine.service() {
+        if !state.supervisor.is_running(kind).await {
+            return Err(Error::msg(format!("Start {} first, then create the database.", engine.label())));
+        }
+    }
+    manage::create(&settings, &layout, &dir, engine, &database).await?;
+    logs::system(&app, logs::Level::Info, format!("Created database {database} in {} for {name}", engine.label()));
+    Ok(())
+}
+
+/// Changes one of the .env settings the Overview shows (APP_URL…).
+#[tauri::command]
+async fn set_project_env(state: State<'_, AppState>, name: String, key: String, value: String) -> Result<()> {
+    let (_, layout) = state.snapshot().await;
+    manage::set_env_value(&project_dir(&layout, &name)?, &key, &value)
+}
+
+/// Which of the given ports something listens on.
+#[tauri::command]
+async fn ports_listening(ports: Vec<u16>) -> Result<Vec<u16>> {
+    tauri::async_runtime::spawn_blocking(move || manage::listening(&ports)).await.map_err(|e| Error::msg(e.to_string()))
+}
+
+/// A site's own php.ini settings and Xdebug choice; PHP restarts with the web servers.
+#[tauri::command]
+async fn set_site_php_ini(app: AppHandle, state: State<'_, AppState>, name: String, values: std::collections::BTreeMap<String, String>, xdebug: bool) -> Result<()> {
+    let _op = state.ops.lock().await;
+    let (_, layout) = state.snapshot().await;
+    project_dir(&layout, &name)?;
+    for (key, value) in &values {
+        if !configs::site_ini_ok(key, value) {
+            return Err(Error::msg(format!("{key} = {value} isn't valid: use a size like 512M (or -1), whole seconds, or On/Off.")));
+        }
+    }
+    state
+        .update_settings(|s| {
+            let own = s.sites.entry(name.clone()).or_default();
+            own.php_ini = values;
+            own.xdebug = xdebug;
+        })
+        .await?;
+    logs::system(&app, logs::Level::Info, format!("Saved {name}'s PHP settings"));
+    restart_web_servers(&app, &state).await
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectFileInfo {
+    file: projectfile::ProjectFile,
+    /// The project's setup is already what the file says.
+    matches: bool,
+}
+
+/// The project's lamprabit.toml, if it has one, and whether its setup already matches it.
+#[tauri::command]
+async fn project_file(state: State<'_, AppState>, name: String) -> Result<Option<ProjectFileInfo>> {
+    let (settings, layout) = state.snapshot().await;
+    let dir = project_dir(&layout, &name)?;
+    let Some(file) = projectfile::read(&dir)? else { return Ok(None) };
+    let parent = format!("{}.{}", sites::label(&name).unwrap_or_default(), settings.tld);
+    let current = projectfile::ProjectFile::from_settings(&settings.sites.get(&name).cloned().unwrap_or_default(), &parent);
+    Ok(Some(ProjectFileInfo { matches: current == file, file }))
+}
+
+/// Writes the project's setup to lamprabit.toml in its folder.
+#[tauri::command]
+async fn save_project_file(app: AppHandle, state: State<'_, AppState>, name: String) -> Result<()> {
+    let (settings, layout) = state.snapshot().await;
+    let dir = project_dir(&layout, &name)?;
+    let parent = format!("{}.{}", sites::label(&name).unwrap_or_default(), settings.tld);
+    let file = projectfile::ProjectFile::from_settings(&settings.sites.get(&name).cloned().unwrap_or_default(), &parent);
+    projectfile::write(&dir, &file)?;
+    logs::system(&app, logs::Level::Info, format!("Saved {name}'s setup to {}", projectfile::FILE));
+    Ok(())
+}
+
+/// Stops everything running for a project: its app, processes, command and tunnels.
+async fn stop_project(app: &AppHandle, state: &AppState, name: &str) {
+    let (settings, _) = state.snapshot().await;
+    state.apps.stop_processes(app, &settings, name, false).await;
+    state.apps.stop_command(name).await;
+    state.apps.stop(app, name).await;
+    for tunnel in state.tunnels.list().await.into_iter().filter(|t| t.site.as_deref() == Some(name)) {
+        state.tunnels.stop(app, &tunnel.id).await;
+    }
+}
+
+/// Renames a project's folder, moving its settings and subdomains along. Its database
+/// keeps its name (MySQL can't rename one); the .env still points at it.
+#[tauri::command]
+async fn rename_project(app: AppHandle, state: State<'_, AppState>, name: String, new_name: String) -> Result<()> {
+    let _op = state.ops.lock().await;
+    let (settings, layout) = state.snapshot().await;
+    let dir = project_dir(&layout, &name)?;
+    let new_name = new_name.trim().to_string();
+    if new_name == name {
+        return Ok(());
+    }
+    // Only the case changes: Windows sees the same folder, so skip the "taken" check.
+    if !new_name.eq_ignore_ascii_case(&name) {
+        manage::check_project_name(&layout, &new_name)?;
+    }
+    stop_project(&app, &state, &name).await;
+    let target = layout.www().join(&new_name);
+    std::fs::rename(&dir, &target).map_err(|e| Error::msg(format!("Couldn't rename {name}: {e}. Close editors, terminals and anything else using its folder, then try again.")))?;
+    let old_suffix = format!(".{}.{}", sites::label(&name).unwrap_or_default(), settings.tld);
+    let new_suffix = format!(".{}.{}", sites::label(&new_name).unwrap_or_default(), settings.tld);
+    state
+        .update_settings(|s| {
+            if let Some(mut own) = s.sites.remove(&name) {
+                for d in &mut own.domains {
+                    if let Some(sub) = d.host.strip_suffix(&old_suffix) {
+                        d.host = format!("{sub}{new_suffix}");
+                    }
+                }
+                s.sites.insert(new_name.clone(), own);
+            }
+            // Profiles name processes as "project/process".
+            for profile in &mut s.profiles {
+                for key in &mut profile.processes {
+                    if let Some(process) = key.strip_prefix(&format!("{name}/")) {
+                        *key = format!("{new_name}/{process}");
+                    }
+                }
+            }
+        })
+        .await?;
+    logs::system(&app, logs::Level::Info, format!("Renamed {name} to {new_name}"));
+    sync_sites(&app, &state).await
+}
+
+/// Deletes a project: stops it, drops its database if asked, and moves its folder to the
+/// Recycle Bin (Trash), so it can still be brought back.
+#[tauri::command]
+async fn delete_project(app: AppHandle, state: State<'_, AppState>, name: String, drop_database: bool) -> Result<()> {
+    let _op = state.ops.lock().await;
+    let (settings, layout) = state.snapshot().await;
+    let dir = project_dir(&layout, &name)?;
+    stop_project(&app, &state, &name).await;
+    if drop_database {
+        let database = sites::scan(&settings, &layout).into_iter().find(|s| s.name == name).and_then(|s| s.database);
+        if let (Some(database), Some(engine)) = (database, manage::engine(&settings, &dir)) {
+            if let Some(kind) = engine.service() {
+                if !state.supervisor.is_running(kind).await {
+                    return Err(Error::msg(format!("Start {} to drop {database}, or delete the project without its database.", engine.label())));
+                }
+            }
+            manage::drop(&settings, &layout, engine, &database).await?;
+            logs::system(&app, logs::Level::Info, format!("Dropped database {database}"));
+        }
+    }
+    let folder = dir.clone();
+    tauri::async_runtime::spawn_blocking(move || trash::delete(&folder))
+        .await
+        .map_err(|e| Error::msg(e.to_string()))?
+        .map_err(|e| Error::msg(format!("Couldn't move {name} to the Recycle Bin: {e}. Close editors, terminals and anything else using its folder, then try again.")))?;
+    state.update_settings(|s| {
+        s.sites.remove(&name);
+        for profile in &mut s.profiles {
+            profile.processes.retain(|k| !k.starts_with(&format!("{name}/")));
+        }
+    })
+    .await?;
+    logs::system(&app, logs::Level::Info, format!("Deleted {name} (moved to the Recycle Bin)"));
+    sync_sites(&app, &state).await
+}
+
 #[tauri::command]
 async fn stop_project_command(state: State<'_, AppState>, name: String) -> Result<()> {
     state.apps.stop_command(&name).await;
@@ -1170,7 +2114,7 @@ async fn tunnel_start(
         None => None,
     };
     if let Some(s) = &site {
-        let kind = if s.server == config::Server::Nginx { ServiceKind::Nginx } else { ServiceKind::Apache };
+        let kind = server_kind(s.server);
         if !state.supervisor.is_running(kind).await {
             return Err(Error::msg(format!("Start {} first; the tunnel forwards to it.", kind.label())));
         }
@@ -1438,11 +2382,62 @@ async fn log_history(app: AppHandle, state: State<'_, AppState>) -> Result<logs:
     Ok(logs::history(&app, &layout.logs()))
 }
 
+/// The dumps caught this session, oldest first.
 #[tauri::command]
-async fn clear_logs(app: AppHandle, state: State<'_, AppState>) -> Result<()> {
+fn list_dumps(app: AppHandle) -> Vec<dumps::Dump> {
+    app.state::<dumps::DumpStore>().all()
+}
+
+/// Turns the dump catcher on or off; PHP restarts with the web servers to pick it up.
+#[tauri::command]
+async fn set_catch_dumps(app: AppHandle, state: State<'_, AppState>, enabled: bool) -> Result<()> {
+    let _op = state.ops.lock().await;
+    state.update_settings(|s| s.catch_dumps = enabled).await?;
+    logs::system(&app, logs::Level::Info, if enabled { "Catching dump() and dd() in Logs" } else { "dump() and dd() show in the page again" });
+    restart_web_servers(&app, &state).await
+}
+
+/// Keeps the dump listener in step with the settings: listening on `ports.dumps` while
+/// "Catch dumps" is on, closed otherwise.
+fn spawn_dump_listener(handle: &AppHandle) {
+    let handle = handle.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut current: Option<(u16, tauri::async_runtime::JoinHandle<()>)> = None;
+        loop {
+            let (settings, layout) = handle.state::<AppState>().snapshot().await;
+            let wanted = settings.catch_dumps.then_some(settings.ports.dumps);
+            let finished = current.as_ref().is_some_and(|(_, task)| task.inner().is_finished());
+            if current.as_ref().map(|(p, _)| *p) != wanted || finished {
+                if let Some((_, task)) = current.take() {
+                    task.abort();
+                }
+                if let Some(port) = wanted {
+                    let (app, www) = (handle.clone(), layout.www());
+                    let task = tauri::async_runtime::spawn(async move {
+                        if let Err(e) = dumps::serve(app.clone(), port, www).await {
+                            logs::system(&app, logs::Level::Warn, format!("Can't catch dumps on port {port}: {e}. Change the dumps port in Settings → Ports."));
+                        }
+                    });
+                    current = Some((port, task));
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(if finished { 30 } else { 2 })).await;
+        }
+    });
+}
+
+/// Empties the log files of one source ("apache", "dumps", "project:shop"), or all of them.
+#[tauri::command]
+async fn clear_logs(app: AppHandle, state: State<'_, AppState>, source: Option<String>) -> Result<()> {
     let (_, layout) = state.snapshot().await;
-    let failed = logs::clear(&app, &layout.logs());
-    logs::system(&app, logs::Level::Info, "Logs cleared");
+    let failed = logs::clear(&app, &layout.logs(), source.as_deref());
+    if source.is_none() || source.as_deref() == Some("dumps") {
+        app.state::<dumps::DumpStore>().clear();
+    }
+    logs::system(&app, logs::Level::Info, match &source {
+        Some(s) => format!("Logs of {} cleared", s.strip_prefix("project:").unwrap_or(s)),
+        None => "Logs cleared".to_string(),
+    });
     if failed.is_empty() {
         Ok(())
     } else {
@@ -1467,9 +2462,28 @@ struct PortStatus {
 async fn port_status(state: State<'_, AppState>) -> Result<Vec<PortStatus>> {
     let (settings, layout) = state.snapshot().await;
     let p = &settings.ports;
-    let mut ports = vec![("http", p.http), ("https", p.https), ("mysql", p.mysql), ("mysqlServer", p.mysql_server), ("mailSmtp", p.mail_smtp), ("mailUi", p.mail_ui), ("phpFpm", p.php_fpm), ("redis", p.redis), ("memcached", p.memcached)];
-    if settings.web_server == config::WebServer::Both {
-        ports.extend([("nginxHttp", p.nginx_http), ("nginxHttps", p.nginx_https)]);
+    let mut ports = vec![("http", p.http), ("https", p.https), ("mysql", p.mysql), ("mysqlServer", p.mysql_server), ("mailSmtp", p.mail_smtp), ("mailUi", p.mail_ui), ("phpFpm", p.php_fpm), ("redis", p.redis), ("memcached", p.memcached), ("postgres", p.postgres), ("pgadmin", p.pgadmin), ("mongodb", p.mongodb), ("clickhouseHttp", p.clickhouse_http), ("clickhouseTcp", p.clickhouse_tcp), ("neo4jHttp", p.neo4j_http), ("neo4jBolt", p.neo4j_bolt), ("meilisearch", p.meilisearch), ("typesense", p.typesense), ("rustfs", p.rustfs), ("rustfsConsole", p.rustfs_console), ("ollama", p.ollama), ("minio", p.minio), ("minioConsole", p.minio_console), ("elasticsearch", p.elasticsearch), ("elasticsearchTransport", p.elasticsearch_transport), ("opensearch", p.opensearch), ("opensearchTransport", p.opensearch_transport), ("n8n", p.n8n), ("rabbitmq", p.rabbitmq), ("rabbitmqManagement", p.rabbitmq_management)];
+    // Servers that aren't the primary one have their own pair of ports.
+    for &server in settings.web_servers.iter().skip(1) {
+        let (http, https) = settings.server_ports(server);
+        ports.extend(match server {
+            config::Server::Apache => [("apacheHttp", http), ("apacheHttps", https)],
+            config::Server::Nginx => [("nginxHttp", http), ("nginxHttps", https)],
+            config::Server::Caddy => [("caddyHttp", http), ("caddyHttps", https)],
+            config::Server::Frankenphp => [("frankenphpHttp", http), ("frankenphpHttps", https)],
+        });
+    }
+    if settings.server_enabled(config::Server::Caddy) {
+        ports.push(("caddyAdmin", p.caddy_admin));
+    }
+    if settings.server_enabled(config::Server::Frankenphp) {
+        ports.push(("frankenphpAdmin", p.frankenphp_admin));
+    }
+    if settings.versions.get("tomcat").is_some() {
+        ports.extend([("tomcatHttp", p.tomcat_http), ("tomcatShutdown", p.tomcat_shutdown)]);
+    }
+    if settings.catch_dumps {
+        ports.push(("dumps", p.dumps));
     }
     let mut out = Vec::new();
     for (key, port) in ports {
@@ -1550,15 +2564,15 @@ async fn diagnostics(state: State<'_, AppState>, redact: bool) -> Result<String>
     let _ = writeln!(r, "\n## Environment\n");
     let _ = writeln!(r, "- Root: {}", layout.root().display());
     let _ = writeln!(r, "- Domain suffix: .{}", settings.tld);
-    let _ = writeln!(r, "- Web server: {:?}", settings.web_server);
+    let servers: Vec<&str> = settings.web_servers.iter().map(|s| s.label()).collect();
+    let _ = writeln!(r, "- Web servers: {}", servers.join(", "));
     let _ = writeln!(r, "- HTTPS by default: {}", settings.https_by_default);
     let _ = writeln!(r, "- Manage hosts file: {}", settings.manage_hosts);
     let _ = writeln!(r, "- PHP mail() to Mailpit: {}", settings.route_mail);
 
     let _ = writeln!(r, "\n## Runtimes\n\n| Runtime | Active | Installed |\n|---|---|---|");
     for runtime in Runtime::ALL {
-        let mut s = settings.clone();
-        let active = active_version(&mut s, runtime).clone().unwrap_or_else(|| "—".into());
+        let active = settings.versions.get(runtime.id()).cloned().unwrap_or_else(|| "—".into());
         let installed = runtimes::installed(&layout, runtime).join(", ");
         let _ = writeln!(r, "| {} | {active} | {} |", runtime.id(), if installed.is_empty() { "—".into() } else { installed });
     }
@@ -1605,7 +2619,7 @@ async fn diagnostics(state: State<'_, AppState>, redact: bool) -> Result<String>
         let _ = writeln!(r, "- PHP {}: {}/{} workers alive, ports {}-{}", p.version, p.alive, p.workers, p.port, p.port + p.workers - 1);
     }
 
-    for kind in [ServiceKind::Apache, ServiceKind::Nginx] {
+    for kind in ServiceKind::WEB {
         let _ = writeln!(r, "\n## {} configuration test\n", kind.label());
         let _ = match services::config_test(kind, &settings, &layout).await {
             None => writeln!(r, "Not run (not installed or never started)."),
@@ -1673,19 +2687,32 @@ fn check_port(port: u16) -> bool {
     services::port_free(port)
 }
 
+/// Every runtime with its group, description, source, platform gaps and companions.
 #[tauri::command]
-async fn runtime_catalog(state: State<'_, AppState>, runtime: Runtime) -> Result<Vec<Release>> {
-    runtimes::available(&state.http, runtime).await
+fn runtime_info() -> catalog::Catalog {
+    catalog::catalog()
+}
+
+/// What a runtime version needs, and how each need gets met (see `catalog::requirements`).
+#[tauri::command]
+async fn runtime_requirements(app: AppHandle, state: State<'_, AppState>, runtime: Runtime, version: Option<String>) -> Result<Vec<catalog::Requirement>> {
+    let (settings, layout) = state.snapshot().await;
+    catalog::requirements(&app, &state.http, &settings, &layout, runtime, version).await
+}
+
+#[tauri::command]
+async fn runtime_catalog(state: State<'_, AppState>, runtime: Runtime, fresh: Option<bool>) -> Result<Vec<Release>> {
+    runtimes::available(&state.http, runtime, fresh.unwrap_or(false)).await
 }
 
 #[tauri::command]
 async fn installed_runtimes(state: State<'_, AppState>) -> Result<Vec<InstalledRuntime>> {
-    let (mut settings, layout) = state.snapshot().await;
+    let (settings, layout) = state.snapshot().await;
     Ok(Runtime::ALL
         .into_iter()
         .map(|runtime| InstalledRuntime {
             runtime,
-            active: active_version(&mut settings, runtime).clone(),
+            active: settings.versions.get(runtime.id()).cloned(),
             versions: runtimes::installed(&layout, runtime),
         })
         .collect())
@@ -1700,7 +2727,37 @@ async fn install_runtime(app: AppHandle, state: State<'_, AppState>, release: Re
     let (_, layout) = state.snapshot().await;
     let label = format!("{} {}", release.runtime.id(), release.version);
     logs::system(&app, logs::Level::Info, format!("Installing {label} from {}", release.url));
-    let result = runtimes::install(&app, &state.http, &layout, &release).await;
+    let result = async {
+        runtimes::install(&app, &state.http, &layout, &release).await?;
+        // Some runtimes need a setup step after the download; the install isn't finished
+        // (and the version isn't used) until it is.
+        let setup = match release.runtime {
+            Runtime::Rust => {
+                logs::system(&app, logs::Level::Info, format!("Installing Rust {} with rustup", release.version));
+                runtimes::setup_rust(&layout, &release.version).await
+            }
+            Runtime::N8n => {
+                logs::system(&app, logs::Level::Info, "Installing n8n and its packages with npm (several minutes)");
+                runtimes::setup_n8n(&layout, &release.version).await
+            }
+            Runtime::Pgadmin => {
+                logs::system(&app, logs::Level::Info, "Installing pgAdmin's Python packages (a few minutes)");
+                let settings = state.snapshot().await.0;
+                runtimes::setup_pgadmin(&app, &settings, &layout, &release.version).await
+            }
+            Runtime::Phpredisadmin => {
+                logs::system(&app, logs::Level::Info, "Adding Predis, phpRedisAdmin's Redis client");
+                runtimes::add_predis(&state.http, &layout, &release.version).await
+            }
+            _ => Ok(()),
+        };
+        if runtimes::has_setup(release.runtime) {
+            let stage = if setup.is_ok() { "done" } else { "error" };
+            let _ = tauri::Emitter::emit(&app, "install-progress", runtimes::InstallProgress { runtime: release.runtime, version: release.version.clone(), stage, downloaded: 0, total: None });
+        }
+        setup
+    }
+    .await;
     state.installing.lock().await.remove(&key);
     match &result {
         Ok(()) => logs::system(&app, logs::Level::Info, format!("Installed {label}")),
@@ -1712,27 +2769,23 @@ async fn install_runtime(app: AppHandle, state: State<'_, AppState>, release: Re
     let mut activated = false;
     state
         .update_settings(|s| {
-            let active = active_version(s, release.runtime);
-            if active.is_none() {
-                *active = Some(release.version.clone());
+            if s.versions.get(release.runtime.id()).is_none() {
+                s.versions.set(release.runtime.id(), Some(release.version.clone()));
                 activated = true;
             }
         })
         .await?;
-    // phpRedisAdmin needs its PHP Redis client next to it.
-    if release.runtime == Runtime::Phpredisadmin {
-        logs::system(&app, logs::Level::Info, "Adding Predis, phpRedisAdmin's Redis client");
-        runtimes::add_predis(&state.http, &layout, &release.version).await?;
-    }
-    // A new tool brings a domain and, for Mailpit, PHP mail settings: Apache picks both up on restart.
+    // A new tool brings a domain and, for Mailpit, PHP mail settings: the primary web
+    // server picks both up on restart.
     if activated && is_tool(release.runtime) {
-        restart_if_running(&app, &state, ServiceKind::Apache).await?;
+        let primary = server_kind(state.snapshot().await.0.primary_server());
+        restart_if_running(&app, &state, primary).await?;
     }
     Ok(())
 }
 
 fn is_tool(runtime: Runtime) -> bool {
-    matches!(runtime, Runtime::Mailpit | Runtime::Adminer | Runtime::Phpmyadmin | Runtime::Phpredisadmin)
+    matches!(runtime, Runtime::Mailpit | Runtime::Adminer | Runtime::Phpmyadmin | Runtime::Phpredisadmin | Runtime::Phppgadmin | Runtime::Pgadmin | Runtime::Neo4j | Runtime::N8n)
 }
 
 async fn restart_if_running(app: &AppHandle, state: &AppState, kind: ServiceKind) -> Result<()> {
@@ -1747,10 +2800,10 @@ async fn restart_if_running(app: &AppHandle, state: &AppState, kind: ServiceKind
 
 #[tauri::command]
 async fn remove_runtime(app: AppHandle, state: State<'_, AppState>, runtime: Runtime, version: String) -> Result<()> {
-    let (mut settings, layout) = state.snapshot().await;
-    let was_active = active_version(&mut settings, runtime).as_deref() == Some(version.as_str());
+    let (settings, layout) = state.snapshot().await;
+    let was_active = settings.versions.get(runtime.id()) == Some(&version);
     // Web tools are just files served by Apache, which restarts below instead of blocking.
-    if was_active && !matches!(runtime, Runtime::Adminer | Runtime::Phpmyadmin | Runtime::Phpredisadmin) {
+    if was_active && !matches!(runtime, Runtime::Adminer | Runtime::Phpmyadmin | Runtime::Phpredisadmin | Runtime::Phppgadmin) {
         for &kind in dependents(runtime) {
             if state.supervisor.is_running(kind).await {
                 return Err(Error::msg(format!("Stop {} before removing the version it is using", kind.label())));
@@ -1781,7 +2834,7 @@ async fn remove_runtime(app: AppHandle, state: State<'_, AppState>, runtime: Run
         })
         .await?;
     if was_active && is_tool(runtime) {
-        restart_if_running(&app, &state, ServiceKind::Apache).await?;
+        restart_if_running(&app, &state, server_kind(settings.primary_server())).await?;
     }
     Ok(())
 }
@@ -1812,12 +2865,81 @@ async fn set_active_version(
     }
 
     logs::system(&app, logs::Level::Info, format!("Switching {} to {version}", runtime.id()));
-    let settings = state.update_settings(|s| *active_version(s, runtime) = Some(version)).await?;
+    let settings = state.update_settings(|s| s.versions.set(runtime.id(), Some(version))).await?;
     let layout = Layout::new(&settings.root_dir);
     for kind in restart {
         state.supervisor.start(&app, kind, &settings, &layout).await?;
     }
     Ok(())
+}
+
+/// Crashed services come back after a short pause when Settings says so; the pause lets
+/// ports and lock files go first.
+fn spawn_crash_restarts(app: &AppHandle) {
+    let handle = app.clone();
+    let crashes = app.state::<AppState>().supervisor.crashes();
+    tauri::async_runtime::spawn(async move {
+        let Some(mut crashes) = crashes else { return };
+        while let Some(kind) = crashes.recv().await {
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            let state = handle.state::<AppState>();
+            let _op = state.ops.lock().await;
+            let (settings, layout) = state.snapshot().await;
+            // start() already logged and recorded why it failed.
+            let _ = state.supervisor.restart_crashed(&handle, kind, &settings, &layout).await;
+        }
+    });
+}
+
+/// Project processes that exited and should run again (apps.rs decides; this has the
+/// settings to start them with).
+fn spawn_process_restarts(app: &AppHandle) {
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let Some(mut requests) = apps::restart_requests() else { return };
+        while let Some((project, process)) = requests.recv().await {
+            let state = handle.state::<AppState>();
+            let (settings, layout) = state.snapshot().await;
+            if let Err(e) = state.apps.start_process(&handle, &settings, &layout, &project, &process).await {
+                let key = apps::process_key(&project, &process);
+                state.apps.record(&handle, &layout, &key, "error", format!("Couldn't restart {process}: {e}")).await;
+            }
+        }
+    });
+}
+
+/// `--smoke-test`: the services through the real supervisor, without a window or the
+/// user's settings (smoke.rs). Exits with the test's result.
+fn run_smoke_test(mut context: tauri::Context<tauri::Wry>, options: smoke::Options) {
+    context.config_mut().app.windows.clear();
+    let settings = smoke::settings(&options);
+    if let Err(e) = Layout::new(&settings.root_dir).ensure() {
+        eprintln!("smoke test: can't use {}: {e}", settings.root_dir.display());
+        std::process::exit(2);
+    }
+    let settings_path = settings.root_dir.join("settings.toml");
+    let _ = settings.save(&settings_path);
+    let app = tauri::Builder::default()
+        .setup(move |app| {
+            let root = settings.root_dir.clone();
+            app.manage(AppState::new(settings, settings_path));
+            app.manage(logs::LogHub::default());
+            logs::set_system_file(app.handle(), Layout::new(&root).logs().join("lampRabit.log"));
+            spawn_crash_restarts(app.handle());
+            spawn_process_restarts(app.handle());
+            spawn_process_schedules(app.handle());
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let code = smoke::run(handle, options).await;
+                // The services are stopped by now. AppHandle::exit loses the code on Linux
+                // (GTK's loop ends with 0), and CI needs it.
+                std::process::exit(code);
+            });
+            Ok(())
+        })
+        .build(context)
+        .expect("error while building LampRabit");
+    app.run(|_, _| {});
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1826,6 +2948,18 @@ pub fn run() {
     // which would otherwise hand the call to a running copy.
     if std::env::args().any(|a| a == "--uninstall-cleanup") {
         uninstall::cli();
+        return;
+    }
+    let context = tauri::generate_context!();
+    // Also before the single-instance plugin: a LampRabit already open must not take it.
+    if let Some(options) = smoke::options() {
+        match options {
+            Ok(options) => run_smoke_test(context, options),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+        }
         return;
     }
     tauri::Builder::default()
@@ -1865,6 +2999,10 @@ pub fn run() {
             }
             let mut warnings = Vec::new();
             let (mut settings, broken) = Settings::load_or_recover(&settings_path);
+            // A first run: no settings yet, and no LampRabit folder already where they point
+            // (a reinstall keeps using its folder without asking).
+            let fresh = !settings_path.exists() && !["bin", "www", "data"].iter().any(|d| settings.root_dir.join(d).exists());
+            app.manage(FirstRun(std::sync::atomic::AtomicBool::new(fresh)));
             if let Some(aside) = broken {
                 warnings.push(format!(
                     "Your settings file was damaged, so LampRabit started with default settings. The old file was kept as {}.",
@@ -1880,19 +3018,10 @@ pub fn run() {
             if tidy_extension_choices(&mut settings) {
                 let _ = settings.save(&settings_path);
             }
-            app.manage(AppState {
-                settings: RwLock::new(settings),
-                settings_path,
-                supervisor: Supervisor::default(),
-                http: runtimes::client(),
-                installing: Mutex::new(HashSet::new()),
-                ca_trusted: Mutex::new(None),
-                tunnels: tunnels::Tunnels::default(),
-                ops: Mutex::new(()),
-                processes: std::sync::Mutex::new(sysinfo::System::new()),
-                apps: apps::Apps::default(),
-            });
+            app.manage(AppState::new(settings, settings_path));
             app.manage(logs::LogHub::default());
+            app.manage(dumps::DumpStore::default());
+            spawn_dump_listener(app.handle());
             {
                 let root = app.state::<AppState>().settings.try_read().map(|s| s.root_dir.clone()).unwrap_or_default();
                 logs::set_system_file(app.handle(), Layout::new(root).logs().join("lampRabit.log"));
@@ -1931,14 +3060,30 @@ pub fn run() {
                 }
             });
 
+            spawn_crash_restarts(app.handle());
+            spawn_process_restarts(app.handle());
+
             tauri::async_runtime::spawn(watch_ports(app.handle().clone()));
 
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let mut tailer = logs::Tailer::default();
+                let mut polls: u32 = 0;
                 loop {
-                    let dir = Layout::new(&handle.state::<AppState>().settings.read().await.root_dir).logs();
+                    let settings = handle.state::<AppState>().settings.read().await.clone();
+                    let dir = Layout::new(&settings.root_dir).logs();
                     tailer.poll(&handle, &dir);
+                    // About once a minute: keep log files to their size (Settings → Logs).
+                    polls = polls.wrapping_add(1);
+                    if polls % 150 == 1 {
+                        let mb = |n: u32| u64::from(n.max(1)) * 1024 * 1024;
+                        let (max, keep, total) = (mb(settings.log_max_mb), settings.log_keep, mb(settings.log_total_mb));
+                        let dir2 = dir.clone();
+                        let rotated = tauri::async_runtime::spawn_blocking(move || logs::rotate(&dir2, max, keep, total)).await.unwrap_or(0);
+                        if rotated > 0 {
+                            logs::system(&handle, logs::Level::Info, format!("Rotated {rotated} log file(s) over {} MB", settings.log_max_mb));
+                        }
+                    }
                     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
                 }
             });
@@ -1961,6 +3106,36 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            runtime_info,
+            set_site_worker,
+            set_site_domains,
+            set_site_main,
+            project_folders,
+            set_site_processes,
+            first_run,
+            finish_first_run,
+            template_from_project,
+            save_template,
+            list_dumps,
+            set_catch_dumps,
+            apply_processes,
+            project_file,
+            save_project_file,
+            database_status,
+            create_project_database,
+            set_project_env,
+            ports_listening,
+            set_site_php_ini,
+            rename_project,
+            delete_project,
+            command_history,
+            process_next_runs,
+            process_start,
+            process_stop,
+            process_restart,
+            processes_all,
+            restart_frankenphp_workers,
+            runtime_requirements,
             get_settings,
             save_settings,
             env_paths,
@@ -2027,6 +3202,18 @@ pub fn run() {
             ngrok_token_saved,
             set_ngrok_token,
             trust_ca,
+            list_databases,
+            list_backups,
+            backup_database,
+            restore_backup,
+            delete_backup,
+            open_compass,
+            check_move_target,
+            environment_in_use,
+            stop_environment_holder,
+            move_environment,
+            ollama_elsewhere,
+            set_language_version,
             open_db_client,
             runtime_catalog,
             installed_runtimes,
@@ -2034,7 +3221,7 @@ pub fn run() {
             remove_runtime,
             set_active_version,
         ])
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("error while building LampRabit")
         .run(|app, event| {
             if let RunEvent::Exit = event {

@@ -49,7 +49,7 @@
     "shortDescription": "Local PHP development environment: Apache or Nginx, PHP and MariaDB with automatic .test sites",
     "longDescription": "LampRabit runs a complete local PHP stack: Apache or Nginx, several PHP versions side by side, MariaDB, Redis, Mailpit and database tools. Every folder in www becomes https://<folder>.test with a trusted local certificate.",
     "copyright": "© 2026 LampRabit contributors",
-    "homepage": "https://github.com/Shivam-SV/LampRabit",
+    "homepage": "https://lamprabit.shivam-vastav33.workers.dev/",
     "windows": {
       "nsis": {
         "installMode": "currentUser",

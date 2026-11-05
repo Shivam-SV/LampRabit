@@ -41,6 +41,7 @@ requires:
   extensions: [mbstring, openssl, pdo_mysql]
 
 database: optional
+engines: [mariadb, mysql, postgres]
 
 variables:
   - id: stack
@@ -94,8 +95,12 @@ done: "Ready at {{url}}. Register an account to try Breeze."
 | `duration` | | A hint such as `Composer · about a minute`. |
 | `requires.php` | | Lowest PHP version (`"8.2"`) or `any`. Leave it out for projects without PHP; the wizard then hides the PHP choice. |
 | `requires.extensions` | | PHP extensions that must be loaded. Checked with `php -m` before anything is created; the error says to turn them on in Services → PHP → Extensions. |
+| `requires.python` | | Lowest Python version (`"3.10"`) for Python projects. LampRabit's Python must be installed (checked before anything is created); `python` and `pip` are on PATH in steps, and `{{venv.python}}` is a virtual environment's Python. |
+| `requires.java` | | Lowest Java version (`"17"`) for Java projects. LampRabit's Java must be installed; steps and the dev server get `JAVA_HOME`. |
+| `requires.go`, `requires.rust` | | Lowest Go (`"1.22"`) or Rust (`"1.80"`) version. LampRabit's own must be installed; `go`, `cargo` and `rustc` are on PATH in steps and the dev server (Rust with LampRabit's rustup homes). |
 | `requires.node` | | `true` for JavaScript projects: the wizard asks for a Node.js version (from NVM) and a package manager, and the `{{pm.*}}` placeholders work. |
 | `database` | | `none` (default), `optional` (a switch, on when a database server is installed) or `required`. |
+| `engines` | | The database servers the project can be set up for: `mariadb`, `mysql`, `postgres`, `sqlite` (a file: `{{database}}` is then the path `database/database.sqlite`, and nothing is created up front). Default `[mariadb, mysql]`. With more than one installed, the wizard lets the user pick; write the config with the `db.*` placeholders so it works for each. |
 | `variables` | | Extra fields in the wizard (below). |
 | `steps` | yes | What to do, in order (below). |
 | `serve` | | How the project's domain is served (below). Without it, the web server serves the files, with PHP. |
@@ -224,10 +229,15 @@ Write `{{name}}` anywhere a step takes text. Unknown names are reported when the
 | `{{www}}`, `{{dir}}` | The www folder, the project folder |
 | `{{php_version}}` | The PHP version the project uses |
 | `{{database}}` | The database name from the wizard (empty when none) |
-| `{{db.engine}}` | `mariadb` or `mysql` (the default database server) |
+| `{{db.engine}}` | `mariadb`, `mysql` or `pgsql` (Laravel's connection names) for the server chosen in the wizard |
 | `{{db.host}}`, `{{db.port}}` | `127.0.0.1` and the server's port |
 | `{{db.user}}`, `{{db.password}}` | `root` and an empty password |
-| `{{db.server_version}}` | `11.8.9-MariaDB` or `8.4.13` (Doctrine's `serverVersion`) |
+| `{{db.server_version}}` | `11.8.9-MariaDB`, `8.4.13` or `18` (Doctrine's `serverVersion`) |
+| `{{venv.python}}` | `.venv\Scripts\python.exe` on Windows, `.venv/bin/python` elsewhere |
+| `{{mvnw}}` | Maven's wrapper: `mvnw.cmd` on Windows, `sh mvnw` elsewhere (zips drop the executable bit) |
+| `{{java_major}}` | The active Java's major version (`21`) |
+| `{{db.scheme}}`, `{{db.charset}}` | `mysql` and `utf8mb4`, or `postgresql` and `utf8` (database URLs) |
+| `{{db.pdo}}` | PDO's driver name: `mysql` (MariaDB too), `pgsql` or `sqlite`; empty when the project has no database, so `if: db.pdo == pgsql` adds PostgreSQL-only steps |
 | `{{mail.host}}`, `{{mail.port}}` | Mailpit's SMTP server |
 | `{{vars.<id>}}` | A variable's value |
 | `{{random:N}}` | N random characters (1–256), safe inside quoted PHP and `.env` strings |
@@ -270,7 +280,7 @@ The domain follows what's listening. Every few seconds LampRabit looks for ports
 - when the port goes away, the domain switches back to the files after a few seconds (a dev server restarting itself doesn't flip it);
 - PHP projects stay on PHP: their package.json dev server (Vite for assets) isn't routed unless you pick its port ("Route here", e.g. for `php artisan serve`), and "Back to PHP" undoes that.
 
-**Start** on the Sites page keeps the project's port if it's still free, or picks the next free one from 3000, and starts the site's web server if it's stopped. Projects only start from the Sites page, never with Start all or a stack profile.
+**Start** on the Sites page keeps the project's port if it's still free, or picks the next free one from 3000, and starts the site's web server if it's stopped. A project's dev server only starts from the Sites page, never with Start all or a stack profile; a profile can start project processes it lists explicitly.
 
 ### Commands
 
@@ -284,6 +294,48 @@ commands:
 ```
 
 The Commands tab lists the commands you saved, then the template's `list`, then what `discover` finds. Sources: `package.json` and `composer.json` scripts, `artisan`, `console` (Symfony's `bin/console`), `magento`, `please` (Statamic), `drush`, `cake` and `spark`. Commands run in the project folder with its PHP and Node.js versions first on PATH, one at a time per project, and their output goes to the project's log (Logs → the project). `run` takes the placeholders above.
+
+### Processes
+
+Long-running commands the project gets, listed under Sites → Commands → Keep running:
+
+```yaml
+processes:
+  - name: queue                      # lowercase letters, digits, dashes; once each
+    command: php artisan queue:work --tries=3
+    restart: always                  # on-failure (default), always or never
+    autostart: false                 # true (default): starts with the project
+  - name: api
+    cwd: api                         # a folder of the project; the project folder when absent
+    command: node server.js --port {port}
+    port: auto                       # a free port, or a number from 1024 up; also $PORT
+    env: { NODE_ENV: development }
+    if: vars.api                     # only when this holds, like a step's if:
+```
+
+`command`, `cwd` and `env` values take the placeholders above; `{port}` (single braces) is the process's port, filled in each time it starts. `port: auto` picks a different free port for every project made from the template.
+
+### Domains
+
+Subdomains of the project's own domain (Sites → Domains):
+
+```yaml
+domains:
+  - name: admin                      # admin.<project>.test
+    root: admin/public               # a folder of the project ("" for the main domain's)
+  - name: api
+    process: api                     # one of the processes above; it needs a port
+  - name: docs
+    port: 8090                       # anything listening on that port
+  - name: preview                    # none of the three: wherever the main domain goes
+    if: database
+```
+
+Give at most one of `root`, `port` and `process`. A subdomain pointing at a process that its `if:` left out is left out too.
+
+### Making templates in the app
+
+New project → **New template** opens a guided form (where the code comes from, PHP and the database, the usual install steps, processes and subdomains) with the YAML next to it, for anything the form doesn't cover. A project's Settings → **Save as a template** opens the editor on a template that recreates that project: a `git clone` of its remote, its Composer and Node installs, `.env` from `.env.example`, Laravel's key and migrations, its database, PHP version, dev server, saved commands, processes and subdomains. Either way the template is checked like one loaded from the folder before it's saved to `<root>/templates/<id>.yaml`.
 
 ## What happens when you click Create
 

@@ -7,8 +7,9 @@ color: blue
 duration: Composer · a few minutes
 requires:
   php: "8.3"
-  extensions: [dom, gd, mbstring, pdo_mysql, simplexml, xml]
+  extensions: [dom, gd, mbstring, simplexml, xml]
 database: optional
+engines: [mariadb, mysql, postgres]
 steps:
   - create_database: {}
   - name: Creating the project with Composer (drupal/recommended-project)
@@ -38,10 +39,14 @@ steps:
           'password' => '{{db.password}}',
           'host' => '{{db.host}}',
           'port' => '{{db.port}}',
-          'driver' => 'mysql',
+          'driver' => '{{db.pdo}}',
           'prefix' => '',
           'collation' => 'utf8mb4_general_ci',
         ];
+  # Drupal's installer refuses PostgreSQL without pg_trgm.
+  - name: Adding PostgreSQL's pg_trgm extension
+    if: db.pdo == pgsql
+    run: psql -d "{{database}}" -c "CREATE EXTENSION IF NOT EXISTS pg_trgm"
   - id: git
     optional: true
     default: false
